@@ -23,9 +23,9 @@ rfb_dataset as
     left join `basedosdados.br_bd_diretorios_brasil.municipio` mun
       on es.id_municipio = mun.id_municipio
 
-  where emp.data = '2023-05-18'
-  and es.data = '2023-05-18'
-  and ( razao_social like 'COPEL%'
+  where emp.data = '2024-01-01'
+  and es.data = '2025-03-31'
+  and ( razao_social like 'GLOBO%'
   )
 )
 
@@ -110,5 +110,5 @@ select
   ,max(descricao_atividade_secundaria10) as descricao_atividade_secundaria_10
   ,t1.data_info
 from rfb_dataset_cnae_sec_desc_transposed t1
---where cnpj = '02558157040032'
+--where cnpj = 
 group by 1,2,3,4,5,6,7,28
