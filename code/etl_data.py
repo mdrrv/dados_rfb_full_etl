@@ -1,7 +1,3 @@
-# Autor: Vinicius Madureira
-# Projeto: Extração de dados de CNPJs
-# Última atualização: 21/08/2025
-
 import datetime
 import gc
 import pathlib
@@ -161,6 +157,10 @@ db_schema = os.getenv('DB_SCHEMA')
 engine = create_engine(f'postgresql://{user}:{password}@{host}:{port}/{database}?options=-csearch_path%3D{db_schema}')
 conn = psycopg2.connect(f"dbname={database} user={user} host={host} port={port} password={password}")
 cur = conn.cursor()
+
+# Garante que o schema existe antes de qualquer operação
+cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{db_schema}";')
+conn.commit()
 
 #############################################
 # Truncar tabelas existentes (caso já tenham sido criadas)
