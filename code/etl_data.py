@@ -1,3 +1,7 @@
+# Autor: Vinicius Madureira
+# Projeto: Extração de dados de CNPJs
+# Última atualização: 21/08/2025
+
 import datetime
 import gc
 import pathlib
