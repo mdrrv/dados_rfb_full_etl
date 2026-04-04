@@ -9,7 +9,8 @@ import requests
 import urllib.request
 import wget
 import zipfile
-import email.utils 
+import email.utils
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import psycopg2
@@ -20,20 +21,23 @@ import bs4 as bs
 #############################################
 # Funções de apoio
 #############################################
-def check_diff(url, file_name):
+def check_diff(url, file_name, auth=None):
     """
-    Verifica se o arquivo no servidor existe no disco e se ele tem o mesmo
-    tamanho no servidor.
+    Verifica se o arquivo no servidor existe no disco e se ele tem o mesmo tamanho.
     """
     if not os.path.isfile(file_name):
         return True  # arquivo ainda não baixado
-    response = requests.head(url)
-    new_size = int(response.headers.get('content-length', 0))
-    old_size = os.path.getsize(file_name)
-    if new_size != old_size:
-        os.remove(file_name)
-        return True  # tamanhos diferentes
-    return False  # arquivos idênticos
+    
+    try:
+        response = requests.head(url, auth=auth)
+        new_size = int(response.headers.get('content-length', 0))
+        old_size = os.path.getsize(file_name)
+        if new_size != old_size:
+            os.remove(file_name)
+            return True  # tamanhos diferentes
+        return False  # arquivos idênticos
+    except:
+        return True # Em caso de erro na checagem, baixa o arquivo novamente
 
 def makedirs(path):
     """
@@ -61,43 +65,40 @@ def to_sql(dataframe, **kwargs):
         sys.stdout.write(f'\r{progress}')
     sys.stdout.write('\n')
 
-def get_latest_update_url_by_name(base_url):
+def get_latest_update_url_by_name():
     """
-    Captura a lista de subdiretórios no formato YYYY-MM/ e retorna
-    a URL correspondente à data (ano-mês) mais recente.
-    Exemplo de base_url:
-        "https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/"
+    Lista as pastas via protocolo WebDAV do Nextcloud e retorna a URL da mais recente.
     """
-    response = requests.get(base_url)
-    if not response.ok:
+    url = "https://arquivos.receitafederal.gov.br/public.php/webdav/Dados/Cadastros/CNPJ/"
+    
+    # Em links públicos do Nextcloud, o usuário WebDAV é o próprio token da URL
+    auth = ('gn672Ad4CF8N6TK', '') 
+    
+    # PROPFIND é o método para listar diretórios
+    response = requests.request('PROPFIND', url, auth=auth, headers={'Depth': '1'})
+    
+    if response.status_code not in (200, 207):
         return None
-
-    soup = bs.BeautifulSoup(response.text, 'lxml')
+        
+    root = ET.fromstring(response.content)
+    namespaces = {'d': 'DAV:'}
     
-    # Extrair todos os links no padrão "YYYY-MM/"
     year_month_dirs = []
-    for link in soup.find_all('a'):
-        href = link.get('href', '')
-        # Verifica se corresponde a algo como "2025-02/" ou "2023-10/"
-        if re.match(r'^\d{4}-\d{2}/$', href):
-            # Remove a barra do final (2025-02)
-            year_month_dirs.append(href.strip('/'))
-    
+    for node in root.findall('d:response', namespaces):
+        href = node.find('d:href', namespaces).text
+        # Procura apenas por pastas no padrão YYYY-MM
+        match = re.search(r'/(\d{4}-\d{2})/?$', href)
+        if match:
+            year_month_dirs.append(match.group(1))
+            
     if not year_month_dirs:
         return None
+        
+    year_month_dirs.sort()
+    latest_dir = year_month_dirs[-1]
     
-    # Converter cada link em (ano, mes) para comparação
-    parsed = []
-    for ym in year_month_dirs:
-        ano, mes = ym.split('-')
-        parsed.append((int(ano), int(mes)))
-    
-    # Ordenar e pegar o último, que será o mais recente
-    parsed.sort()  # ordena por ano e depois por mês
-    latest = parsed[-1]  # tupla (ano, mes) mais recente
-    latest_dir = f"{latest[0]:04d}-{latest[1]:02d}/"  # reconstrói no formato YYYY-MM/
-    
-    return base_url + latest_dir
+    # Retorna o caminho completo da pasta mais recente
+    return url + latest_dir + "/"
 
 def bar_progress(current, total, width=80):
     """
@@ -158,10 +159,6 @@ engine = create_engine(f'postgresql://{user}:{password}@{host}:{port}/{database}
 conn = psycopg2.connect(f"dbname={database} user={user} host={host} port={port} password={password}")
 cur = conn.cursor()
 
-# Garante que o schema existe antes de qualquer operação
-cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{db_schema}";')
-conn.commit()
-
 #############################################
 # Truncar tabelas existentes (caso já tenham sido criadas)
 #############################################
@@ -171,47 +168,59 @@ truncate_tables(cur, conn, tables, db_schema)
 #############################################
 # Definindo a URL dos dados com base na última atualização
 #############################################
-BASE_URL = "https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/"
-dados_rf = get_latest_update_url_by_name(BASE_URL)
+dados_rf = get_latest_update_url_by_name()
+
 if not dados_rf:
     print("Não foi possível encontrar a última atualização dos dados.")
     sys.exit(1)
 print("Última atualização encontrada:", dados_rf)
 
 #############################################
-# Download dos arquivos .zip disponíveis na página
+# Listagem e Download dos arquivos .zip
 #############################################
-raw_html = urllib.request.urlopen(dados_rf).read()
-page_items = bs.BeautifulSoup(raw_html, 'lxml')
-html_str = str(page_items)
+auth = ('gn672Ad4CF8N6TK', '') # Credenciais para o Nextcloud
+
+print("Buscando lista de arquivos na pasta mais recente via WebDAV...")
+response_zips = requests.request('PROPFIND', dados_rf, auth=auth, headers={'Depth': '1'})
+root_zips = ET.fromstring(response_zips.content)
+namespaces = {'d': 'DAV:'}
+
 Files = []
-text = '.zip'
-for m in re.finditer(text, html_str):
-    i_start = m.start() - 40
-    i_end = m.end()
-    i_loc = html_str[i_start:i_end].find('href=') + 6
-    Files.append(html_str[i_start+i_loc:i_end])
-# Correção do nome dos arquivos: removendo entradas que contenham '.zip">' na string
-Files_clean = [f for f in Files if f.find('.zip">') == -1]
-Files = Files_clean
+for node in root_zips.findall('d:response', namespaces):
+    href = node.find('d:href', namespaces).text
+    if href.endswith('.zip'):
+        file_name = href.split('/')[-1]
+        Files.append(file_name)
 
 print("Arquivos que serão baixados:")
 for idx, f in enumerate(Files, 1):
     print(f"{idx} - {f}")
 
-# Realiza o download dos arquivos
 i_l = 0
 for file_entry in Files:
     i_l += 1
     url = dados_rf + file_entry
     file_name = os.path.join(output_files, file_entry)
-    if check_diff(url, file_name):
+    
+    if check_diff(url, file_name, auth=auth):
         print(f"\nBaixando arquivo {i_l} - {file_entry} ...")
-        wget.download(url, out=output_files, bar=bar_progress)
+        # Utilizando requests com stream permite exibir progresso em arquivos pesados
+        with requests.get(url, auth=auth, stream=True) as r:
+            r.raise_for_status()
+            total_length = int(r.headers.get('content-length', 0))
+            downloaded = 0
+            with open(file_name, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_length:
+                            percent = int(downloaded / total_length * 100)
+                            sys.stdout.write(f"\rDownloading: {percent}% [{downloaded} / {total_length}] bytes")
+                            sys.stdout.flush()
+        print("\nDownload concluído!")
     else:
-        print(f"\nO arquivo {i_l} - {file_entry} já existe na pasta destino e está completo. Pulando o download.")
-
-#############################################
+        print(f"\nO arquivo {i_l} - {file_entry} já existe e está completo. Pulando o download.")#############################################
 # Extração dos arquivos .zip baixados
 #############################################
 i_l = 0
