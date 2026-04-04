@@ -73,7 +73,7 @@ def get_latest_update_url_by_name():
     auth = ('gn672Ad4CF8N6TK', '')
 
     session_init = requests.Session()
-    retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    retries = Retry(total=5, backoff_factor=5, status_forcelist=[429, 500, 502, 503, 504])
     session_init.mount('https://', HTTPAdapter(max_retries=retries))
 
     headers = {
