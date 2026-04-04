@@ -345,8 +345,9 @@ ESTAB_COLS = ['cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'identificador_matriz_fili
               'ddd_2', 'telefone_2', 'ddd_fax', 'fax', 'correio_eletronico',
               'situacao_especial', 'data_situacao_especial']
 
-ESTAB_INT_COLS = ['identificador_matriz_filial', 'situacao_cadastral', 'motivo_situacao_cadastral',
-                  'cnae_fiscal_principal', 'municipio', 'ddd_1', 'ddd_2', 'ddd_fax']
+ESTAB_INT_COLS = ['identificador_matriz_filial', 'situacao_cadastral', 'data_situacao_cadastral',
+                  'motivo_situacao_cadastral', 'data_inicio_atividade', 'cnae_fiscal_principal',
+                  'municipio', 'data_situacao_especial']
 
 NROWS = 2_000_000
 
