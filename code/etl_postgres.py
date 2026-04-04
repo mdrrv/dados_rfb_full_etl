@@ -6,25 +6,19 @@ import re
 import sys
 import time
 import requests
-import urllib.request
-import wget
 import zipfile
-import email.utils
 import xml.etree.ElementTree as ET
-import pandas as pd
+import polars as pl
 import psycopg2
-from sqlalchemy import create_engine
+from io import StringIO
 from dotenv import load_dotenv
-import bs4 as bs
 import shutil
 import random
 
 #############################################
 # Controle de Execução (Log)
 #############################################
-# Marca o horário de início exato do script
 etl_start_time = time.time()
-# Por padrão, assumimos que vai dar certo. Se algo quebrar, mudamos essa variável.
 etl_status = 'Sucesso'
 
 #############################################
@@ -35,44 +29,38 @@ def check_diff(url, file_name, auth=None):
     Verifica se o arquivo no servidor existe no disco e se ele tem o mesmo tamanho.
     """
     if not os.path.isfile(file_name):
-        return True  # arquivo ainda não baixado
-    
+        return True
+
     try:
         response = requests.head(url, auth=auth, timeout=30)
         new_size = int(response.headers.get('content-length', 0))
         old_size = os.path.getsize(file_name)
         if new_size != old_size:
             os.remove(file_name)
-            return True  # tamanhos diferentes
-        return False  # arquivos idênticos
+            return True
+        return False
     except:
-        return True # Em caso de erro na checagem, baixa o arquivo novamente
+        return True
 
 def makedirs(path):
-    """
-    Cria o diretório se este não existir.
-    """
     if not os.path.exists(path):
         os.makedirs(path)
 
-def to_sql(dataframe, **kwargs):
+def to_sql(df: pl.DataFrame, table_name: str, conn, schema: str):
     """
-    Insere os registros no banco de dados em blocos.
+    Insere os registros no banco via PostgreSQL COPY FROM STDIN (bulk insert nativo).
+    Muito mais rápido do que INSERT por lotes.
     """
-    size = 4096  # tamanho do chunk (pode ser parametrizado)
-    total = len(dataframe)
-    name = kwargs.get('name')
-
-    def chunker(df):
-        return (df[i:i + size] for i in range(0, len(df), size))
-
-    for i, df_chunk in enumerate(chunker(dataframe)):
-        df_chunk.to_sql(**kwargs)
-        index = i * size
-        percent = (index * 100) / total
-        progress = f'{name} {percent:.2f}% {index:0{len(str(total))}}/{total}'
-        sys.stdout.write(f'\r{progress}')
-    sys.stdout.write('\n')
+    cur = conn.cursor()
+    col_list = ', '.join(f'"{c}"' for c in df.columns)
+    copy_sql = (
+        f'COPY "{schema}"."{table_name}" ({col_list}) '
+        f"FROM STDIN WITH (FORMAT CSV, HEADER TRUE, NULL '')"
+    )
+    csv_data = df.write_csv(null_value='')
+    cur.copy_expert(copy_sql, StringIO(csv_data))
+    conn.commit()
+    cur.close()
 
 def get_latest_update_url_by_name():
     """
@@ -80,67 +68,55 @@ def get_latest_update_url_by_name():
     """
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
-    
+
     url = "https://arquivos.receitafederal.gov.br/public.php/webdav/Dados/Cadastros/CNPJ/"
-    auth = ('gn672Ad4CF8N6TK', '') 
-    
-    # Criamos uma sessão com retentativas para evitar timeouts na primeira conexão
+    auth = ('gn672Ad4CF8N6TK', '')
+
     session_init = requests.Session()
     retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
     session_init.mount('https://', HTTPAdapter(max_retries=retries))
-    
+
     headers = {
         'Depth': '1',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
-    
+
     print("Conectando ao servidor da Receita Federal para buscar a pasta mais recente...")
-    
+
     try:
-        # PROPFIND é o método para listar diretórios, agora com timeout explícito
         response = session_init.request('PROPFIND', url, auth=auth, headers=headers, timeout=(30, 60))
         response.raise_for_status()
     except Exception as e:
         print(f"Falha ao conectar no servidor raiz da Receita Federal: {e}")
         return None
-        
+
     root = ET.fromstring(response.content)
     namespaces = {'d': 'DAV:'}
-    
+
     year_month_dirs = []
     for node in root.findall('d:response', namespaces):
         href = node.find('d:href', namespaces).text
-        # Procura apenas por pastas no padrão YYYY-MM
         match = re.search(r'/(\d{4}-\d{2})/?$', href)
         if match:
             year_month_dirs.append(match.group(1))
-            
+
     if not year_month_dirs:
         return None
-        
+
     year_month_dirs.sort()
     latest_dir = year_month_dirs[-1]
-    
-    return url + latest_dir + "/"
 
-def bar_progress(current, total, width=80):
-    """
-    Função de callback para exibir o progresso no download.
-    """
-    progress_message = "Downloading: %d%% [%d / %d] bytes - " % (current / total * 100, current, total)
-    sys.stdout.write("\r" + progress_message)
-    sys.stdout.flush()
+    return url + latest_dir + "/"
 
 def truncate_tables(cursor, connection, tables, schema):
     """
-    Verifica se cada tabela da lista já existe no banco e, se sim, executa o comando
-    TRUNCATE para limpar seus dados, reiniciando as chaves primárias.
+    Verifica se cada tabela da lista já existe no banco e, se sim, executa o TRUNCATE.
     """
     for table in tables:
         cursor.execute("""
             SELECT EXISTS (
-                SELECT 1 
-                FROM information_schema.tables 
+                SELECT 1
+                FROM information_schema.tables
                 WHERE table_schema = %s AND table_name = %s
             )
             """, (schema, table))
@@ -162,14 +138,12 @@ if not os.path.isfile(dotenv_path):
 print("Usando arquivo .env em:", dotenv_path)
 load_dotenv(dotenv_path=dotenv_path)
 
-# Diretórios conforme configurado no .env
 output_files = os.getenv('OUTPUT_FILES_PATH')
 extracted_files = os.getenv('EXTRACTED_FILES_PATH')
 makedirs(output_files)
 makedirs(extracted_files)
 print(f"Diretórios definidos:\n output_files: {output_files}\n extracted_files: {extracted_files}")
 
-# Carregar dados do banco e schema
 user = os.getenv('DB_USER')
 password = os.getenv('DB_PASSWORD')
 host = os.getenv('DB_HOST')
@@ -177,13 +151,11 @@ port = os.getenv('DB_PORT')
 database = os.getenv('DB_NAME')
 db_schema = os.getenv('DB_SCHEMA')
 
-# Criação da engine com a configuração de search_path para o schema desejado
-engine = create_engine(f'postgresql://{user}:{password}@{host}:{port}/{database}?options=-csearch_path%3D{db_schema}')
 conn = psycopg2.connect(f"dbname={database} user={user} host={host} port={port} password={password}")
 cur = conn.cursor()
 
 #############################################
-# Truncar tabelas existentes (caso já tenham sido criadas)
+# Truncar tabelas existentes
 #############################################
 tables = ["empresa", "estabelecimento", "socios", "simples", "cnae", "moti", "munic", "natju", "pais", "quals"]
 truncate_tables(cur, conn, tables, db_schema)
@@ -204,14 +176,12 @@ print("Última atualização encontrada:", dados_rf)
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-auth = ('gn672Ad4CF8N6TK', '') # Credenciais para o Nextcloud
+auth = ('gn672Ad4CF8N6TK', '')
 
-# Configurando uma sessão com retentativas automáticas
 session = requests.Session()
 retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
-# Disfarçando o script como se fosse um navegador comum
 headers = {
     'Depth': '1',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -219,13 +189,11 @@ headers = {
 
 print("Buscando lista de arquivos na pasta mais recente via WebDAV...")
 try:
-    # Adicionamos timeout de 60 segundos por tentativa
     response_zips = session.request('PROPFIND', dados_rf, auth=auth, headers=headers, timeout=60)
     response_zips.raise_for_status()
 except Exception as e:
     print(f"Erro fatal ao se comunicar com a Receita Federal: {e}")
-    etl_status = f'Falha: {str(e)[:100]}' # Grava a falha
-    # Em vez de sys.exit(1), você pode usar break ou pular para o final do script
+    etl_status = f'Falha: {str(e)[:100]}'
 
 root_zips = ET.fromstring(response_zips.content)
 namespaces = {'d': 'DAV:'}
@@ -241,32 +209,23 @@ print("Arquivos que serão baixados:")
 for idx, f in enumerate(Files, 1):
     print(f"{idx} - {f}")
 
-i_l = 0
-# Atualizamos o header para o download padrão (sem o Depth)
 headers_download = {'User-Agent': headers['User-Agent']}
+max_tentativas_download = 5
 
-i_l = 0
-headers_download = {'User-Agent': headers['User-Agent']}
-max_tentativas_download = 5 # Você pode até aumentar para 5 tentativas agora que tem o tempo aleatório
-
-for file_entry in Files:
-    i_l += 1
+for i_l, file_entry in enumerate(Files, 1):
     url = dados_rf + file_entry
     file_name = os.path.join(output_files, file_entry)
-    
+
     if check_diff(url, file_name, auth=auth):
-        
         for tentativa in range(1, max_tentativas_download + 1):
             print(f"\nBaixando arquivo {i_l} - {file_entry} (Tentativa {tentativa}/{max_tentativas_download}) ...")
             try:
-                # timeout=(30, 60) significa: 30s para conectar, 60s esperando pacotes
                 with session.get(url, auth=auth, headers=headers_download, stream=True, timeout=(30, 60)) as r:
                     r.raise_for_status()
                     total_length = int(r.headers.get('content-length', 0))
                     downloaded = 0
-                    
                     with open(file_name, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=1024 * 1024): # Chunk de 1MB
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
                             if chunk:
                                 f.write(chunk)
                                 downloaded += len(chunk)
@@ -275,15 +234,13 @@ for file_entry in Files:
                                     sys.stdout.write(f"\rDownloading: {percent}% [{downloaded} / {total_length}] bytes")
                                     sys.stdout.flush()
                 print("\nDownload concluído com sucesso!")
-                break # Sai do loop de tentativas se o download for bem-sucedido
-                
+                break
             except Exception as e:
                 print(f"\nA conexão caiu ou travou durante o download: {e}")
                 if tentativa == max_tentativas_download:
                     print(f"Limite de tentativas atingido. Pulando o arquivo {file_entry}.")
                     etl_status = f'Falha no arquivo {file_entry}'
                 else:
-                    # Pausa aleatória entre 5s e 2 minutos (120s)
                     tempo_espera = random.randint(5, 120)
                     print(f"Aguardando {tempo_espera} segundos antes de recomeçar o download desse arquivo...")
                     time.sleep(tempo_espera)
@@ -293,23 +250,18 @@ for file_entry in Files:
 #############################################
 # Extração dos arquivos .zip baixados
 #############################################
-i_l = 0
-for file_entry in Files:
+for i_l, file_entry in enumerate(Files, 1):
     try:
-        i_l += 1
-        print("Descompactando arquivo:")
-        print(f"{i_l} - {file_entry}")
+        print(f"Descompactando arquivo {i_l} - {file_entry}")
         full_path = os.path.join(output_files, file_entry)
         with zipfile.ZipFile(full_path, 'r') as zip_ref:
             zip_ref.extractall(extracted_files)
     except Exception as e:
         print(f"Erro ao descompactar {file_entry}: {e}")
-        pass
 
 #############################################
-# Início do processo ETL: Leitura, transformação e inserção dos arquivos no banco
+# Classificação dos arquivos extraídos
 #############################################
-# Separa os arquivos extraídos de acordo com cada tipo.
 Items = [name for name in os.listdir(extracted_files) if os.path.isfile(os.path.join(extracted_files, name))]
 arquivos_empresa = []
 arquivos_estabelecimento = []
@@ -343,46 +295,39 @@ for item in Items:
         arquivos_pais.append(item)
     elif "QUALS" in item:
         arquivos_quals.append(item)
-    else:
-        pass
 
 #############################################
 # Processamento dos Arquivos de EMPRESA
 #############################################
 empresa_insert_start = time.time()
 print("\n#######################\n## Arquivos de EMPRESA:\n#######################")
+EMPRESA_COLS = ['cnpj_basico', 'razao_social', 'natureza_juridica',
+                'qualificacao_responsavel', 'capital_social', 'porte_empresa',
+                'ente_federativo_responsavel']
+
 for arquivo in arquivos_empresa:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
-    try:
-        del empresa
-    except:
-        pass
-    # Definindo os dtypes conforme necessário
-    empresa_dtypes = {0: object, 1: object, 2: 'Int32', 3: 'Int32', 4: object, 5: 'Int32', 6: object}
     extracted_file_path = os.path.join(extracted_files, arquivo)
-    empresa = pd.read_csv(
-        filepath_or_buffer=extracted_file_path,
-        sep=';',
-        header=None,
-        dtype=empresa_dtypes,
-        encoding='latin-1'
+    empresa = pl.read_csv(
+        extracted_file_path,
+        separator=';',
+        has_header=False,
+        encoding='latin1',
+        infer_schema_length=0,
+        new_columns=EMPRESA_COLS,
     )
-    empresa = empresa.reset_index(drop=True)
-    empresa.columns = ['cnpj_basico', 'razao_social', 'natureza_juridica', 
-                       'qualificacao_responsavel', 'capital_social', 'porte_empresa', 
-                       'ente_federativo_responsavel']
-    # Substituir vírgula por ponto em capital_social e converter para float
-    empresa['capital_social'] = empresa['capital_social'].apply(lambda x: x.replace(',', '.'))
-    empresa['capital_social'] = empresa['capital_social'].astype(float)
-    # Inserir os dados na tabela "empresa" com o schema definido
-    to_sql(empresa, name='empresa', con=engine, if_exists='append', index=False, schema=db_schema)
+    empresa = empresa.with_columns([
+        pl.col('natureza_juridica').cast(pl.Int32, strict=False),
+        pl.col('qualificacao_responsavel').cast(pl.Int32, strict=False),
+        pl.col('porte_empresa').cast(pl.Int32, strict=False),
+        pl.col('capital_social').str.replace(',', '.', literal=True).cast(pl.Float64, strict=False),
+    ])
+    to_sql(empresa, 'empresa', conn, db_schema)
     print(f"Arquivo {arquivo} inserido com sucesso no banco de dados!")
-try:
     del empresa
-except:
-    pass
+
 empresa_insert_end = time.time()
-print("Tempo de execução do processo de EMPRESA (segundos):", round((empresa_insert_end - empresa_insert_start)))
+print("Tempo de execução do processo de EMPRESA (segundos):", round(empresa_insert_end - empresa_insert_start))
 
 #############################################
 # Processamento dos Arquivos de ESTABELECIMENTO
@@ -390,137 +335,133 @@ print("Tempo de execução do processo de EMPRESA (segundos):", round((empresa_i
 estabelecimento_insert_start = time.time()
 print("\n###############################\n## Arquivos de ESTABELECIMENTO:\n###############################")
 print(f"Tem {len(arquivos_estabelecimento)} arquivos de estabelecimento!")
+
+ESTAB_COLS = ['cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'identificador_matriz_filial',
+              'nome_fantasia', 'situacao_cadastral', 'data_situacao_cadastral',
+              'motivo_situacao_cadastral', 'nome_cidade_exterior', 'pais',
+              'data_inicio_atividade', 'cnae_fiscal_principal', 'cnae_fiscal_secundaria',
+              'tipo_logradouro', 'logradouro', 'numero', 'complemento',
+              'bairro', 'cep', 'uf', 'municipio', 'ddd_1', 'telefone_1',
+              'ddd_2', 'telefone_2', 'ddd_fax', 'fax', 'correio_eletronico',
+              'situacao_especial', 'data_situacao_especial']
+
+ESTAB_INT_COLS = ['identificador_matriz_filial', 'situacao_cadastral', 'motivo_situacao_cadastral',
+                  'cnae_fiscal_principal', 'municipio', 'ddd_1', 'ddd_2', 'ddd_fax']
+
+NROWS = 2_000_000
+
 for arquivo in arquivos_estabelecimento:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
-    try:
-        del estabelecimento
-        gc.collect()
-    except:
-        pass
-    estabelecimento_dtypes = {0: object, 1: object, 2: object, 3: 'Int32', 4: object, 5: 'Int32', 6: 'Int32',
-                              7: 'Int32', 8: object, 9: object, 10: 'Int32', 11: 'Int32', 12: object, 13: object,
-                              14: object, 15: object, 16: object, 17: object, 18: object, 19: object,
-                              20: 'Int32', 21: object, 22: object, 23: object, 24: object, 25: object,
-                              26: object, 27: object, 28: object, 29: 'Int32'}
     extracted_file_path = os.path.join(extracted_files, arquivo)
-    NROWS = 2000000
+    skip = 0
     part = 0
     while True:
-        estabelecimento = pd.read_csv(
-            filepath_or_buffer=extracted_file_path,
-            sep=';',
-            nrows=NROWS,
-            skiprows=NROWS * part,
-            header=None,
-            dtype=estabelecimento_dtypes,
-            encoding='latin-1'
+        chunk = pl.read_csv(
+            extracted_file_path,
+            separator=';',
+            has_header=False,
+            encoding='latin1',
+            infer_schema_length=0,
+            new_columns=ESTAB_COLS,
+            n_rows=NROWS,
+            skip_rows=skip,
         )
-        estabelecimento = estabelecimento.reset_index(drop=True)
-        estabelecimento.columns = ['cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'identificador_matriz_filial',
-                                   'nome_fantasia', 'situacao_cadastral', 'data_situacao_cadastral',
-                                   'motivo_situacao_cadastral', 'nome_cidade_exterior', 'pais',
-                                   'data_inicio_atividade', 'cnae_fiscal_principal', 'cnae_fiscal_secundaria',
-                                   'tipo_logradouro', 'logradouro', 'numero', 'complemento',
-                                   'bairro', 'cep', 'uf', 'municipio', 'ddd_1', 'telefone_1',
-                                   'ddd_2', 'telefone_2', 'ddd_fax', 'fax', 'correio_eletronico',
-                                   'situacao_especial', 'data_situacao_especial']
-        # Inserir os dados na tabela "estabelecimento" com schema
-        to_sql(estabelecimento, name='estabelecimento', con=engine, if_exists='append', index=False, schema=db_schema)
-        print(f"Arquivo {arquivo} / parte {part} inserido com sucesso no banco de dados!")
-        if len(estabelecimento) == NROWS:
-            part += 1
-        else:
+        if chunk.is_empty():
             break
-    try:
-        del estabelecimento
-    except:
-        pass
+        chunk = chunk.with_columns([
+            pl.col(c).cast(pl.Int32, strict=False) for c in ESTAB_INT_COLS
+        ])
+        to_sql(chunk, 'estabelecimento', conn, db_schema)
+        print(f"Arquivo {arquivo} / parte {part} inserida com sucesso!")
+        skip += NROWS
+        part += 1
+        if len(chunk) < NROWS:
+            del chunk
+            break
+        del chunk
+        gc.collect()
+
 estabelecimento_insert_end = time.time()
-print("Tempo de execução do processo de ESTABELECIMENTO (segundos):", round((estabelecimento_insert_end - estabelecimento_insert_start)))
+print("Tempo de execução do processo de ESTABELECIMENTO (segundos):", round(estabelecimento_insert_end - estabelecimento_insert_start))
 
 #############################################
 # Processamento dos Arquivos de SÓCIOS
 #############################################
 socios_insert_start = time.time()
 print("\n######################\n## Arquivos de SÓCIOS:\n######################")
+
+SOCIOS_COLS = ['cnpj_basico', 'identificador_socio', 'nome_socio_razao_social', 'cpf_cnpj_socio',
+               'qualificacao_socio', 'data_entrada_sociedade', 'pais', 'representante_legal',
+               'nome_do_representante', 'qualificacao_representante_legal', 'faixa_etaria']
+
+SOCIOS_INT_COLS = ['identificador_socio', 'qualificacao_socio', 'qualificacao_representante_legal', 'faixa_etaria']
+
 for arquivo in arquivos_socios:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
-    try:
-        del socios
-    except:
-        pass
-    socios_dtypes = {0: object, 1: 'Int32', 2: object, 3: object, 4: 'Int32', 5: 'Int32', 6: 'Int32',
-                     7: object, 8: object, 9: 'Int32', 10: 'Int32'}
     extracted_file_path = os.path.join(extracted_files, arquivo)
-    socios = pd.read_csv(
-        filepath_or_buffer=extracted_file_path,
-        sep=';',
-        header=None,
-        dtype=socios_dtypes,
-        encoding='latin-1'
+    socios = pl.read_csv(
+        extracted_file_path,
+        separator=';',
+        has_header=False,
+        encoding='latin1',
+        infer_schema_length=0,
+        new_columns=SOCIOS_COLS,
     )
-    socios = socios.reset_index(drop=True)
-    socios.columns = ['cnpj_basico', 'identificador_socio', 'nome_socio_razao_social', 'cpf_cnpj_socio',
-                      'qualificacao_socio', 'data_entrada_sociedade', 'pais', 'representante_legal',
-                      'nome_do_representante', 'qualificacao_representante_legal', 'faixa_etaria']
-    to_sql(socios, name='socios', con=engine, if_exists='append', index=False, schema=db_schema)
+    socios = socios.with_columns([
+        pl.col(c).cast(pl.Int32, strict=False) for c in SOCIOS_INT_COLS
+    ])
+    to_sql(socios, 'socios', conn, db_schema)
     print(f"Arquivo {arquivo} inserido com sucesso no banco de dados!")
-try:
     del socios
-except:
-    pass
+
 socios_insert_end = time.time()
-print("Tempo de execução do processo de SÓCIOS (segundos):", round((socios_insert_end - socios_insert_start)))
+print("Tempo de execução do processo de SÓCIOS (segundos):", round(socios_insert_end - socios_insert_start))
 
 #############################################
 # Processamento dos Arquivos do SIMPLES NACIONAL
 #############################################
 simples_insert_start = time.time()
 print("\n################################\n## Arquivos do SIMPLES NACIONAL:\n################################")
+
+SIMPLES_COLS = ['cnpj_basico', 'opcao_pelo_simples', 'data_opcao_simples',
+                'data_exclusao_simples', 'opcao_mei', 'data_opcao_mei', 'data_exclusao_mei']
+
+SIMPLES_INT_COLS = ['data_opcao_simples', 'data_exclusao_simples', 'data_opcao_mei', 'data_exclusao_mei']
+
+NROWS_SIMPLES = 1_000_000
+
 for arquivo in arquivos_simples:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
-    try:
-        del simples
-    except:
-        pass
-    simples_dtypes = {0: object, 1: object, 2: 'Int32', 3: 'Int32', 4: object, 5: 'Int32', 6: 'Int32'}
     extracted_file_path = os.path.join(extracted_files, arquivo)
-    # Verificar número de linhas
-    simples_lenght = sum(1 for line in open(extracted_file_path, "r", encoding="latin-1"))
-    print(f"Linhas no arquivo do Simples {arquivo}: {simples_lenght}")
-    tamanho_das_partes = 1000000  # registros por carga
-    partes = round(simples_lenght / tamanho_das_partes)
-    nrows = tamanho_das_partes
-    skiprows = 0
-    print(f"Este arquivo será dividido em {partes} partes para inserção no banco de dados.")
-    for i in range(0, partes):
-        print(f"Iniciando a parte {i+1} [...]")
-        simples = pd.read_csv(
-            filepath_or_buffer=extracted_file_path,
-            sep=';',
-            nrows=nrows,
-            skiprows=skiprows,
-            header=None,
-            dtype=simples_dtypes,
-            encoding='latin-1'
+    skip = 0
+    part = 0
+    while True:
+        chunk = pl.read_csv(
+            extracted_file_path,
+            separator=';',
+            has_header=False,
+            encoding='latin1',
+            infer_schema_length=0,
+            new_columns=SIMPLES_COLS,
+            n_rows=NROWS_SIMPLES,
+            skip_rows=skip,
         )
-        simples = simples.reset_index(drop=True)
-        simples.columns = ['cnpj_basico', 'opcao_pelo_simples', 'data_opcao_simples',
-                           'data_exclusao_simples', 'opcao_mei', 'data_opcao_mei',
-                           'data_exclusao_mei']
-        skiprows += nrows
-        to_sql(simples, name='simples', con=engine, if_exists='append', index=False, schema=db_schema)
-        print(f"Arquivo {arquivo} parte {i+1} inserido com sucesso no banco de dados!")
-        try:
-            del simples
-        except:
-            pass
-try:
-    del simples
-except:
-    pass
+        if chunk.is_empty():
+            break
+        chunk = chunk.with_columns([
+            pl.col(c).cast(pl.Int32, strict=False) for c in SIMPLES_INT_COLS
+        ])
+        to_sql(chunk, 'simples', conn, db_schema)
+        print(f"Arquivo {arquivo} parte {part + 1} inserida com sucesso!")
+        skip += NROWS_SIMPLES
+        part += 1
+        if len(chunk) < NROWS_SIMPLES:
+            del chunk
+            break
+        del chunk
+
 simples_insert_end = time.time()
-print("Tempo de execução do processo do SIMPLES (segundos):", round((simples_insert_end - simples_insert_start)))
+print("Tempo de execução do processo do SIMPLES (segundos):", round(simples_insert_end - simples_insert_start))
 
 #############################################
 # Processamento dos Arquivos de CNAE
@@ -529,28 +470,21 @@ cnae_insert_start = time.time()
 print("\n######################\n## Arquivos de CNAE:\n######################")
 for arquivo in arquivos_cnae:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
-    try:
-        del cnae
-    except:
-        pass
     extracted_file_path = os.path.join(extracted_files, arquivo)
-    cnae = pd.read_csv(
-        filepath_or_buffer=extracted_file_path,
-        sep=';',
-        header=None,
-        dtype='object',
-        encoding='latin-1'
+    cnae = pl.read_csv(
+        extracted_file_path,
+        separator=';',
+        has_header=False,
+        encoding='latin1',
+        infer_schema_length=0,
+        new_columns=['codigo', 'descricao'],
     )
-    cnae = cnae.reset_index(drop=True)
-    cnae.columns = ['codigo', 'descricao']
-    to_sql(cnae, name='cnae', con=engine, if_exists='append', index=False, schema=db_schema)
+    to_sql(cnae, 'cnae', conn, db_schema)
     print(f"Arquivo {arquivo} inserido com sucesso no banco de dados!")
-try:
     del cnae
-except:
-    pass
+
 cnae_insert_end = time.time()
-print("Tempo de execução do processo de CNAE (segundos):", round((cnae_insert_end - cnae_insert_start)))
+print("Tempo de execução do processo de CNAE (segundos):", round(cnae_insert_end - cnae_insert_start))
 
 #############################################
 # Processamento dos Arquivos de MOTIVOS (MOTI)
@@ -559,29 +493,22 @@ moti_insert_start = time.time()
 print("\n#########################################\n## Arquivos de MOTIVOS:\n#########################################")
 for arquivo in arquivos_moti:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
-    try:
-        del moti
-    except:
-        pass
-    moti_dtypes = {0: 'Int32', 1: object}
     extracted_file_path = os.path.join(extracted_files, arquivo)
-    moti = pd.read_csv(
-        filepath_or_buffer=extracted_file_path,
-        sep=';',
-        header=None,
-        dtype=moti_dtypes,
-        encoding='latin-1'
+    moti = pl.read_csv(
+        extracted_file_path,
+        separator=';',
+        has_header=False,
+        encoding='latin1',
+        infer_schema_length=0,
+        new_columns=['codigo', 'descricao'],
     )
-    moti = moti.reset_index(drop=True)
-    moti.columns = ['codigo', 'descricao']
-    to_sql(moti, name='moti', con=engine, if_exists='append', index=False, schema=db_schema)
+    moti = moti.with_columns(pl.col('codigo').cast(pl.Int32, strict=False))
+    to_sql(moti, 'moti', conn, db_schema)
     print(f"Arquivo {arquivo} inserido com sucesso no banco de dados!")
-try:
     del moti
-except:
-    pass
+
 moti_insert_end = time.time()
-print("Tempo de execução do processo de MOTI (segundos):", round((moti_insert_end - moti_insert_start)))
+print("Tempo de execução do processo de MOTI (segundos):", round(moti_insert_end - moti_insert_start))
 
 #############################################
 # Processamento dos Arquivos de MUNICÍPIOS (MUNIC)
@@ -590,29 +517,22 @@ munic_insert_start = time.time()
 print("\n##########################\n## Arquivos de MUNICÍPIOS:\n##########################")
 for arquivo in arquivos_munic:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
-    try:
-        del munic
-    except:
-        pass
-    munic_dtypes = {0: 'Int32', 1: object}
     extracted_file_path = os.path.join(extracted_files, arquivo)
-    munic = pd.read_csv(
-        filepath_or_buffer=extracted_file_path,
-        sep=';',
-        header=None,
-        dtype=munic_dtypes,
-        encoding='latin-1'
+    munic = pl.read_csv(
+        extracted_file_path,
+        separator=';',
+        has_header=False,
+        encoding='latin1',
+        infer_schema_length=0,
+        new_columns=['codigo', 'descricao'],
     )
-    munic = munic.reset_index(drop=True)
-    munic.columns = ['codigo', 'descricao']
-    to_sql(munic, name='munic', con=engine, if_exists='append', index=False, schema=db_schema)
+    munic = munic.with_columns(pl.col('codigo').cast(pl.Int32, strict=False))
+    to_sql(munic, 'munic', conn, db_schema)
     print(f"Arquivo {arquivo} inserido com sucesso no banco de dados!")
-try:
     del munic
-except:
-    pass
+
 munic_insert_end = time.time()
-print("Tempo de execução do processo de MUNICÍPIOS (segundos):", round((munic_insert_end - munic_insert_start)))
+print("Tempo de execução do processo de MUNICÍPIOS (segundos):", round(munic_insert_end - munic_insert_start))
 
 #############################################
 # Processamento dos Arquivos de NATUREZA JURÍDICA (NATJU)
@@ -621,29 +541,22 @@ natju_insert_start = time.time()
 print("\n#################################\n## Arquivos de NATUREZA JURÍDICA:\n#################################")
 for arquivo in arquivos_natju:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
-    try:
-        del natju
-    except:
-        pass
-    natju_dtypes = {0: 'Int32', 1: object}
     extracted_file_path = os.path.join(extracted_files, arquivo)
-    natju = pd.read_csv(
-        filepath_or_buffer=extracted_file_path,
-        sep=';',
-        header=None,
-        dtype=natju_dtypes,
-        encoding='latin-1'
+    natju = pl.read_csv(
+        extracted_file_path,
+        separator=';',
+        has_header=False,
+        encoding='latin1',
+        infer_schema_length=0,
+        new_columns=['codigo', 'descricao'],
     )
-    natju = natju.reset_index(drop=True)
-    natju.columns = ['codigo', 'descricao']
-    to_sql(natju, name='natju', con=engine, if_exists='append', index=False, schema=db_schema)
+    natju = natju.with_columns(pl.col('codigo').cast(pl.Int32, strict=False))
+    to_sql(natju, 'natju', conn, db_schema)
     print(f"Arquivo {arquivo} inserido com sucesso no banco de dados!")
-try:
     del natju
-except:
-    pass
+
 natju_insert_end = time.time()
-print("Tempo de execução do processo de NATUREZA JURÍDICA (segundos):", round((natju_insert_end - natju_insert_start)))
+print("Tempo de execução do processo de NATUREZA JURÍDICA (segundos):", round(natju_insert_end - natju_insert_start))
 
 #############################################
 # Processamento dos Arquivos de PAÍS
@@ -652,29 +565,22 @@ pais_insert_start = time.time()
 print("\n######################\n## Arquivos de PAÍS:\n######################")
 for arquivo in arquivos_pais:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
-    try:
-        del pais
-    except:
-        pass
-    pais_dtypes = {0: 'Int32', 1: object}
     extracted_file_path = os.path.join(extracted_files, arquivo)
-    pais = pd.read_csv(
-        filepath_or_buffer=extracted_file_path,
-        sep=';',
-        header=None,
-        dtype=pais_dtypes,
-        encoding='latin-1'
+    pais = pl.read_csv(
+        extracted_file_path,
+        separator=';',
+        has_header=False,
+        encoding='latin1',
+        infer_schema_length=0,
+        new_columns=['codigo', 'descricao'],
     )
-    pais = pais.reset_index(drop=True)
-    pais.columns = ['codigo', 'descricao']
-    to_sql(pais, name='pais', con=engine, if_exists='append', index=False, schema=db_schema)
+    pais = pais.with_columns(pl.col('codigo').cast(pl.Int32, strict=False))
+    to_sql(pais, 'pais', conn, db_schema)
     print(f"Arquivo {arquivo} inserido com sucesso no banco de dados!")
-try:
     del pais
-except:
-    pass
+
 pais_insert_end = time.time()
-print("Tempo de execução do processo de PAÍS (segundos):", round((pais_insert_end - pais_insert_start)))
+print("Tempo de execução do processo de PAÍS (segundos):", round(pais_insert_end - pais_insert_start))
 
 #############################################
 # Processamento dos Arquivos de QUALIFICAÇÃO DE SÓCIOS (QUALS)
@@ -683,35 +589,28 @@ quals_insert_start = time.time()
 print("\n######################################\n## Arquivos de QUALIFICAÇÃO DE SÓCIOS:\n######################################")
 for arquivo in arquivos_quals:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
-    try:
-        del quals
-    except:
-        pass
-    quals_dtypes = {0: 'Int32', 1: object}
     extracted_file_path = os.path.join(extracted_files, arquivo)
-    quals = pd.read_csv(
-        filepath_or_buffer=extracted_file_path,
-        sep=';',
-        header=None,
-        dtype=quals_dtypes,
-        encoding='latin-1'
+    quals = pl.read_csv(
+        extracted_file_path,
+        separator=';',
+        has_header=False,
+        encoding='latin1',
+        infer_schema_length=0,
+        new_columns=['codigo', 'descricao'],
     )
-    quals = quals.reset_index(drop=True)
-    quals.columns = ['codigo', 'descricao']
-    to_sql(quals, name='quals', con=engine, if_exists='append', index=False, schema=db_schema)
+    quals = quals.with_columns(pl.col('codigo').cast(pl.Int32, strict=False))
+    to_sql(quals, 'quals', conn, db_schema)
     print(f"Arquivo {arquivo} inserido com sucesso no banco de dados!")
-try:
     del quals
-except:
-    pass
+
 quals_insert_end = time.time()
-print("Tempo de execução do processo de QUALIFICAÇÃO DE SÓCIOS (segundos):", round((quals_insert_end - quals_insert_start)))
+print("Tempo de execução do processo de QUALIFICAÇÃO DE SÓCIOS (segundos):", round(quals_insert_end - quals_insert_start))
 
 #############################################
 # Finalizando a carga e informando o tempo total
 #############################################
 insert_end = time.time()
-Tempo_insert = round((insert_end - empresa_insert_start))  # Exemplo: utilização do tempo do primeiro processo
+Tempo_insert = round(insert_end - empresa_insert_start)
 print("\n#############################################")
 print("## Processo de carga dos arquivos finalizado!")
 print(f"Tempo total de execução do processo (segundos): {Tempo_insert}")
@@ -729,28 +628,26 @@ cur.execute(f"""
 conn.commit()
 index_end = time.time()
 print("Índices criados nas tabelas (empresa, estabelecimento, socios, simples).")
-print("Tempo para criar os índices (segundos):", round((index_end - index_start)))
+print("Tempo para criar os índices (segundos):", round(index_end - index_start))
 
 #############################################
-# Limpeza dos arquivos temporários (Downloads e Extraídos)
+# Limpeza dos arquivos temporários
 #############################################
 print("\n#############################################")
 print("## Iniciando a limpeza dos arquivos temporários...")
 limpeza_start = time.time()
 
 def limpar_diretorio(caminho_pasta):
-    """Remove todos os arquivos e subdiretórios dentro de uma pasta específica."""
     for nome_arquivo in os.listdir(caminho_pasta):
         caminho_completo = os.path.join(caminho_pasta, nome_arquivo)
         try:
             if os.path.isfile(caminho_completo) or os.path.islink(caminho_completo):
-                os.unlink(caminho_completo) # Remove o arquivo
+                os.unlink(caminho_completo)
             elif os.path.isdir(caminho_completo):
-                shutil.rmtree(caminho_completo) # Remove subdiretórios, se houver
+                shutil.rmtree(caminho_completo)
         except Exception as e:
             print(f"Falha ao deletar {caminho_completo}. Motivo: {e}")
 
-# Executa a limpeza nas duas pastas configuradas no .env
 print(f"Limpando arquivos compactados (.zip) em: {output_files}")
 limpar_diretorio(output_files)
 
@@ -758,7 +655,7 @@ print(f"Limpando arquivos extraídos em: {extracted_files}")
 limpar_diretorio(extracted_files)
 
 limpeza_end = time.time()
-print(f"Arquivos limpos com sucesso! Tempo de limpeza (segundos): {round((limpeza_end - limpeza_start))}")
+print(f"Arquivos limpos com sucesso! Tempo de limpeza (segundos): {round(limpeza_end - limpeza_start)}")
 
 #############################################
 # Gravação do Log de Execução
@@ -766,17 +663,14 @@ print(f"Arquivos limpos com sucesso! Tempo de limpeza (segundos): {round((limpez
 print("\n#############################################")
 print("## Gravando log de execução no banco de dados...")
 
-# Extrai o nome da pasta baixada da URL (ex: '2026-03')
 try:
     folder_date = dados_rf.strip('/').split('/')[-1] if dados_rf else 'Desconhecido'
 except:
     folder_date = 'Desconhecido'
 
-# Calcula a duração total em segundos
 etl_end_time = time.time()
 duracao_total = round(etl_end_time - etl_start_time)
 
-# 1. Cria a tabela 'execution' caso ela ainda não exista
 cur.execute(f"""
     CREATE TABLE IF NOT EXISTS "{db_schema}"."execution" (
         id SERIAL PRIMARY KEY,
@@ -787,16 +681,15 @@ cur.execute(f"""
     );
 """)
 
-# 2. Insere o registro da execução atual
 cur.execute(f"""
-    INSERT INTO "{db_schema}"."execution" 
+    INSERT INTO "{db_schema}"."execution"
     (folder_date, execution_timestamp, duration_seconds, status)
     VALUES (%s, %s, %s, %s);
 """, (folder_date, datetime.datetime.now(), duracao_total, etl_status))
 
-# Confirma a transação no banco
 conn.commit()
+cur.close()
+conn.close()
 
 print(f"Log registrado! Status: {etl_status} | Duração: {duracao_total}s | Referência: {folder_date}")
-
 print("\nProcesso 100% finalizado! Você já pode usar seus dados no BD!")
