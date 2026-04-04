@@ -11,12 +11,12 @@ import wget
 import zipfile
 import email.utils
 import xml.etree.ElementTree as ET
-
 import pandas as pd
 import psycopg2
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
 import bs4 as bs
+import shutil
 
 #############################################
 # Funções de apoio
@@ -660,5 +660,34 @@ conn.commit()
 index_end = time.time()
 print("Índices criados nas tabelas (empresa, estabelecimento, socios, simples).")
 print("Tempo para criar os índices (segundos):", round((index_end - index_start)))
+
+#############################################
+# Limpeza dos arquivos temporários (Downloads e Extraídos)
+#############################################
+print("\n#############################################")
+print("## Iniciando a limpeza dos arquivos temporários...")
+limpeza_start = time.time()
+
+def limpar_diretorio(caminho_pasta):
+    """Remove todos os arquivos e subdiretórios dentro de uma pasta específica."""
+    for nome_arquivo in os.listdir(caminho_pasta):
+        caminho_completo = os.path.join(caminho_pasta, nome_arquivo)
+        try:
+            if os.path.isfile(caminho_completo) or os.path.islink(caminho_completo):
+                os.unlink(caminho_completo) # Remove o arquivo
+            elif os.path.isdir(caminho_completo):
+                shutil.rmtree(caminho_completo) # Remove subdiretórios, se houver
+        except Exception as e:
+            print(f"Falha ao deletar {caminho_completo}. Motivo: {e}")
+
+# Executa a limpeza nas duas pastas configuradas no .env
+print(f"Limpando arquivos compactados (.zip) em: {output_files}")
+limpar_diretorio(output_files)
+
+print(f"Limpando arquivos extraídos em: {extracted_files}")
+limpar_diretorio(extracted_files)
+
+limpeza_end = time.time()
+print(f"Arquivos limpos com sucesso! Tempo de limpeza (segundos): {round((limpeza_end - limpeza_start))}")
 
 print("\nProcesso 100% finalizado! Você já pode usar seus dados no BD!")
