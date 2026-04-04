@@ -17,6 +17,15 @@ from sqlalchemy import create_engine
 from dotenv import load_dotenv
 import bs4 as bs
 import shutil
+import random
+
+#############################################
+# Controle de Execução (Log)
+#############################################
+# Marca o horário de início exato do script
+etl_start_time = time.time()
+# Por padrão, assumimos que vai dar certo. Se algo quebrar, mudamos essa variável.
+etl_status = 'Sucesso'
 
 #############################################
 # Funções de apoio
@@ -29,7 +38,7 @@ def check_diff(url, file_name, auth=None):
         return True  # arquivo ainda não baixado
     
     try:
-        response = requests.head(url, auth=auth)
+        response = requests.head(url, auth=auth, timeout=30)
         new_size = int(response.headers.get('content-length', 0))
         old_size = os.path.getsize(file_name)
         if new_size != old_size:
@@ -69,15 +78,30 @@ def get_latest_update_url_by_name():
     """
     Lista as pastas via protocolo WebDAV do Nextcloud e retorna a URL da mais recente.
     """
-    url = "https://arquivos.receitafederal.gov.br/public.php/webdav/Dados/Cadastros/CNPJ/"
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
     
-    # Em links públicos do Nextcloud, o usuário WebDAV é o próprio token da URL
+    url = "https://arquivos.receitafederal.gov.br/public.php/webdav/Dados/Cadastros/CNPJ/"
     auth = ('gn672Ad4CF8N6TK', '') 
     
-    # PROPFIND é o método para listar diretórios
-    response = requests.request('PROPFIND', url, auth=auth, headers={'Depth': '1'})
+    # Criamos uma sessão com retentativas para evitar timeouts na primeira conexão
+    session_init = requests.Session()
+    retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    session_init.mount('https://', HTTPAdapter(max_retries=retries))
     
-    if response.status_code not in (200, 207):
+    headers = {
+        'Depth': '1',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
+    print("Conectando ao servidor da Receita Federal para buscar a pasta mais recente...")
+    
+    try:
+        # PROPFIND é o método para listar diretórios, agora com timeout explícito
+        response = session_init.request('PROPFIND', url, auth=auth, headers=headers, timeout=(30, 60))
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Falha ao conectar no servidor raiz da Receita Federal: {e}")
         return None
         
     root = ET.fromstring(response.content)
@@ -97,7 +121,6 @@ def get_latest_update_url_by_name():
     year_month_dirs.sort()
     latest_dir = year_month_dirs[-1]
     
-    # Retorna o caminho completo da pasta mais recente
     return url + latest_dir + "/"
 
 def bar_progress(current, total, width=80):
@@ -178,10 +201,32 @@ print("Última atualização encontrada:", dados_rf)
 #############################################
 # Listagem e Download dos arquivos .zip
 #############################################
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 auth = ('gn672Ad4CF8N6TK', '') # Credenciais para o Nextcloud
 
+# Configurando uma sessão com retentativas automáticas
+session = requests.Session()
+retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+session.mount('https://', HTTPAdapter(max_retries=retries))
+
+# Disfarçando o script como se fosse um navegador comum
+headers = {
+    'Depth': '1',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
+
 print("Buscando lista de arquivos na pasta mais recente via WebDAV...")
-response_zips = requests.request('PROPFIND', dados_rf, auth=auth, headers={'Depth': '1'})
+try:
+    # Adicionamos timeout de 60 segundos por tentativa
+    response_zips = session.request('PROPFIND', dados_rf, auth=auth, headers=headers, timeout=60)
+    response_zips.raise_for_status()
+except Exception as e:
+    print(f"Erro fatal ao se comunicar com a Receita Federal: {e}")
+    etl_status = f'Falha: {str(e)[:100]}' # Grava a falha
+    # Em vez de sys.exit(1), você pode usar break ou pular para o final do script
+
 root_zips = ET.fromstring(response_zips.content)
 namespaces = {'d': 'DAV:'}
 
@@ -197,30 +242,55 @@ for idx, f in enumerate(Files, 1):
     print(f"{idx} - {f}")
 
 i_l = 0
+# Atualizamos o header para o download padrão (sem o Depth)
+headers_download = {'User-Agent': headers['User-Agent']}
+
+i_l = 0
+headers_download = {'User-Agent': headers['User-Agent']}
+max_tentativas_download = 5 # Você pode até aumentar para 5 tentativas agora que tem o tempo aleatório
+
 for file_entry in Files:
     i_l += 1
     url = dados_rf + file_entry
     file_name = os.path.join(output_files, file_entry)
     
     if check_diff(url, file_name, auth=auth):
-        print(f"\nBaixando arquivo {i_l} - {file_entry} ...")
-        # Utilizando requests com stream permite exibir progresso em arquivos pesados
-        with requests.get(url, auth=auth, stream=True) as r:
-            r.raise_for_status()
-            total_length = int(r.headers.get('content-length', 0))
-            downloaded = 0
-            with open(file_name, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_length:
-                            percent = int(downloaded / total_length * 100)
-                            sys.stdout.write(f"\rDownloading: {percent}% [{downloaded} / {total_length}] bytes")
-                            sys.stdout.flush()
-        print("\nDownload concluído!")
+        
+        for tentativa in range(1, max_tentativas_download + 1):
+            print(f"\nBaixando arquivo {i_l} - {file_entry} (Tentativa {tentativa}/{max_tentativas_download}) ...")
+            try:
+                # timeout=(30, 60) significa: 30s para conectar, 60s esperando pacotes
+                with session.get(url, auth=auth, headers=headers_download, stream=True, timeout=(30, 60)) as r:
+                    r.raise_for_status()
+                    total_length = int(r.headers.get('content-length', 0))
+                    downloaded = 0
+                    
+                    with open(file_name, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024): # Chunk de 1MB
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if total_length:
+                                    percent = int(downloaded / total_length * 100)
+                                    sys.stdout.write(f"\rDownloading: {percent}% [{downloaded} / {total_length}] bytes")
+                                    sys.stdout.flush()
+                print("\nDownload concluído com sucesso!")
+                break # Sai do loop de tentativas se o download for bem-sucedido
+                
+            except Exception as e:
+                print(f"\nA conexão caiu ou travou durante o download: {e}")
+                if tentativa == max_tentativas_download:
+                    print(f"Limite de tentativas atingido. Pulando o arquivo {file_entry}.")
+                    etl_status = f'Falha no arquivo {file_entry}'
+                else:
+                    # Pausa aleatória entre 5s e 2 minutos (120s)
+                    tempo_espera = random.randint(5, 120)
+                    print(f"Aguardando {tempo_espera} segundos antes de recomeçar o download desse arquivo...")
+                    time.sleep(tempo_espera)
     else:
-        print(f"\nO arquivo {i_l} - {file_entry} já existe e está completo. Pulando o download.")#############################################
+        print(f"\nO arquivo {i_l} - {file_entry} já existe e está completo. Pulando o download.")
+
+#############################################
 # Extração dos arquivos .zip baixados
 #############################################
 i_l = 0
@@ -689,5 +759,44 @@ limpar_diretorio(extracted_files)
 
 limpeza_end = time.time()
 print(f"Arquivos limpos com sucesso! Tempo de limpeza (segundos): {round((limpeza_end - limpeza_start))}")
+
+#############################################
+# Gravação do Log de Execução
+#############################################
+print("\n#############################################")
+print("## Gravando log de execução no banco de dados...")
+
+# Extrai o nome da pasta baixada da URL (ex: '2026-03')
+try:
+    folder_date = dados_rf.strip('/').split('/')[-1] if dados_rf else 'Desconhecido'
+except:
+    folder_date = 'Desconhecido'
+
+# Calcula a duração total em segundos
+etl_end_time = time.time()
+duracao_total = round(etl_end_time - etl_start_time)
+
+# 1. Cria a tabela 'execution' caso ela ainda não exista
+cur.execute(f"""
+    CREATE TABLE IF NOT EXISTS "{db_schema}"."execution" (
+        id SERIAL PRIMARY KEY,
+        folder_date VARCHAR(50),
+        execution_timestamp TIMESTAMP,
+        duration_seconds INTEGER,
+        status VARCHAR(50)
+    );
+""")
+
+# 2. Insere o registro da execução atual
+cur.execute(f"""
+    INSERT INTO "{db_schema}"."execution" 
+    (folder_date, execution_timestamp, duration_seconds, status)
+    VALUES (%s, %s, %s, %s);
+""", (folder_date, datetime.datetime.now(), duracao_total, etl_status))
+
+# Confirma a transação no banco
+conn.commit()
+
+print(f"Log registrado! Status: {etl_status} | Duração: {duracao_total}s | Referência: {folder_date}")
 
 print("\nProcesso 100% finalizado! Você já pode usar seus dados no BD!")
