@@ -57,7 +57,7 @@ def to_sql(df: pl.DataFrame, table_name: str, conn, schema: str):
         f'COPY "{schema}"."{table_name}" ({col_list}) '
         f"FROM STDIN WITH (FORMAT CSV, HEADER TRUE, NULL '')"
     )
-    csv_data = df.write_csv(null_value='')
+    csv_data = df.write_csv(null_value='').replace('\x00', '')
     cur.copy_expert(copy_sql, StringIO(csv_data))
     conn.commit()
     cur.close()
