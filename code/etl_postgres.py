@@ -639,6 +639,68 @@ print("Índices criados nas tabelas (empresa, estabelecimento, socios, simples).
 print("Tempo para criar os índices (segundos):", round(index_end - index_start))
 
 #############################################
+# Consolidação: popula cnpj_consolidado
+#############################################
+print("\n#############################################")
+print("## Populando tabela cnpj_consolidado...")
+consolidado_start = time.time()
+
+cur.execute(f'TRUNCATE TABLE "{db_schema}"."cnpj_consolidado";')
+conn.commit()
+
+cur.execute(f"""
+    INSERT INTO "{db_schema}"."cnpj_consolidado" (
+        cnpj, cnpj_basico, razao_social, nome_fantasia,
+        situacao_cadastral, data_situacao_cadastral, data_inicio_atividade,
+        cnae_fiscal_principal, desc_cnae_principal,
+        natureza_juridica, desc_natureza_juridica,
+        capital_social, porte_empresa,
+        opcao_pelo_simples, opcao_mei,
+        logradouro, numero, complemento, bairro, cep,
+        uf, municipio, nome_municipio,
+        ddd_1, telefone_1, correio_eletronico
+    )
+    SELECT
+        es.cnpj_basico || es.cnpj_ordem || es.cnpj_dv,
+        es.cnpj_basico,
+        emp.razao_social,
+        es.nome_fantasia,
+        es.situacao_cadastral,
+        es.data_situacao_cadastral,
+        es.data_inicio_atividade,
+        es.cnae_fiscal_principal,
+        c.descricao,
+        emp.natureza_juridica,
+        nj.descricao,
+        emp.capital_social,
+        emp.porte_empresa,
+        si.opcao_pelo_simples,
+        si.opcao_mei,
+        es.logradouro,
+        es.numero,
+        es.complemento,
+        es.bairro,
+        es.cep,
+        es.uf,
+        es.municipio,
+        mu.descricao,
+        es.ddd_1,
+        es.telefone_1,
+        es.correio_eletronico
+    FROM "{db_schema}"."estabelecimento" es
+    LEFT JOIN "{db_schema}"."empresa" emp ON emp.cnpj_basico       = es.cnpj_basico
+    LEFT JOIN "{db_schema}"."cnae"    c   ON c.codigo              = es.cnae_fiscal_principal
+    LEFT JOIN "{db_schema}"."natju"   nj  ON nj.codigo             = emp.natureza_juridica
+    LEFT JOIN "{db_schema}"."munic"   mu  ON mu.codigo             = es.municipio
+    LEFT JOIN "{db_schema}"."simples" si  ON si.cnpj_basico        = es.cnpj_basico
+    ON CONFLICT (cnpj) DO NOTHING;
+""")
+conn.commit()
+
+consolidado_end = time.time()
+print(f"cnpj_consolidado populado com sucesso! Tempo (segundos): {round(consolidado_end - consolidado_start)}")
+
+#############################################
 # Limpeza dos arquivos temporários
 #############################################
 print("\n#############################################")
