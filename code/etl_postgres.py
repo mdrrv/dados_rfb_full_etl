@@ -220,7 +220,7 @@ for i_l, file_entry in enumerate(Files, 1):
         for tentativa in range(1, max_tentativas_download + 1):
             print(f"\nBaixando arquivo {i_l} - {file_entry} (Tentativa {tentativa}/{max_tentativas_download}) ...")
             try:
-                with session.get(url, auth=auth, headers=headers_download, stream=True, timeout=(30, 60)) as r:
+                with session.get(url, auth=auth, headers=headers_download, stream=True, timeout=(30, 300)) as r:
                     r.raise_for_status()
                     total_length = int(r.headers.get('content-length', 0))
                     downloaded = 0
@@ -234,7 +234,11 @@ for i_l, file_entry in enumerate(Files, 1):
                                     sys.stdout.write(f"\rDownloading: {percent}% [{downloaded} / {total_length}] bytes")
                                     sys.stdout.flush()
                                     if downloaded >= total_length:
+                                        r.close()
                                         break
+                    print("\nDownload concluído com sucesso!")
+                    break
+
                     print("\n")
                 print("\nDownload concluído com sucesso!")
                 break
