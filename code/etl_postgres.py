@@ -233,6 +233,9 @@ for i_l, file_entry in enumerate(Files, 1):
                                     percent = int(downloaded / total_length * 100)
                                     sys.stdout.write(f"\rDownloading: {percent}% [{downloaded} / {total_length}] bytes")
                                     sys.stdout.flush()
+                                    if downloaded >= total_length:
+                                        break
+                    print("\n")
                 print("\nDownload concluído com sucesso!")
                 break
             except Exception as e:
