@@ -70,7 +70,7 @@ def load_table_polars(conn, query, chunk_size=2_000_000):
             if not rows:
                 break
             parts.append(pl.DataFrame(
-                {col: [r[i] for r in rows] for i, col in enumerate(cols)},
+                {col: [str(r[i]) if r[i] is not None else None for r in rows] for i, col in enumerate(cols)},
                 schema={col: pl.Utf8 for col in cols}
             ))
             del rows
