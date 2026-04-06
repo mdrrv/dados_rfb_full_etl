@@ -50,9 +50,10 @@ def to_sql(df: pl.DataFrame, table_name: str, conn, schema: str):
 
 
 def fetch_lookup(conn, name, query, chunk_size=1_000_000):
-    """Carrega tabela de lookup no Polars via server-side cursor (baixo pico de RAM)."""
+    """Carrega tabela de lookup no Polars via cursor client-side com fetchmany."""
     parts = []
-    with conn.cursor(f'lookup_{name}') as lc:
+    # Cursor sem nome = client-side: description disponível logo após execute()
+    with conn.cursor() as lc:
         lc.execute(query)
         cols = [d[0] for d in lc.description]
         while True:
@@ -62,7 +63,6 @@ def fetch_lookup(conn, name, query, chunk_size=1_000_000):
             data = {col: [r[i] for r in rows] for i, col in enumerate(cols)}
             parts.append(pl.DataFrame(data))
             del rows, data
-    conn.commit()
     if not parts:
         return pl.DataFrame()
     df = pl.concat(parts)
