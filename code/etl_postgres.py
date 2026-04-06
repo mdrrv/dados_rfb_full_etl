@@ -639,92 +639,142 @@ print("Índices criados nas tabelas (empresa, estabelecimento, socios, simples).
 print("Tempo para criar os índices (segundos):", round(index_end - index_start))
 
 #############################################
-# Consolidação: popula cnpj_consolidado
+# Consolidação: popula cnpj_consolidado via Polars (JOIN em memória)
+# Estratégia: carrega lookup tables no Polars, faz stream de estabelecimento
+# via server-side cursor (sem OFFSET), JOIN no Python. ~20min vs dias no SQL.
 #############################################
 print("\n#############################################")
-print("## Populando tabela cnpj_consolidado...")
+print("## Populando tabela cnpj_consolidado (Polars + streaming)...")
 consolidado_start = time.time()
 
 cur.execute(f'TRUNCATE TABLE "{db_schema}"."cnpj_consolidado";')
 conn.commit()
 
-cur.execute("SET work_mem = '256MB';")
+DSN = f"dbname={database} user={user} host={host} port={port} password={password}"
 
-# Conta total de registros em estabelecimento para controle do progresso
-cur.execute(f'SELECT COUNT(*) FROM "{db_schema}"."estabelecimento";')
-total_rows = cur.fetchone()[0]
-print(f"Total de estabelecimentos: {total_rows:,}")
+def fetch_lookup(conn, name, query, chunk_size=1_000_000):
+    """Carrega tabela de lookup no Polars via server-side cursor (baixo pico de RAM)."""
+    parts = []
+    with conn.cursor(f'lookup_{name}') as lc:
+        lc.execute(query)
+        cols = [d[0] for d in lc.description]
+        while True:
+            rows = lc.fetchmany(chunk_size)
+            if not rows:
+                break
+            data = {col: [r[i] for r in rows] for i, col in enumerate(cols)}
+            parts.append(pl.DataFrame(data))
+            del rows, data
+    conn.commit()  # fecha o server-side cursor
+    if not parts:
+        return pl.DataFrame()
+    df = pl.concat(parts)
+    del parts
+    gc.collect()
+    print(f"  {name}: {len(df):,} linhas", flush=True)
+    return df
+
+print("Carregando lookups na memória (Polars)...")
+lookup_start = time.time()
+
+empresa_df = fetch_lookup(conn, 'empresa', f'SELECT cnpj_basico, razao_social, natureza_juridica, capital_social, porte_empresa FROM "{db_schema}"."empresa"')
+simples_df = fetch_lookup(conn, 'simples', f'SELECT cnpj_basico, opcao_pelo_simples, data_opcao_simples, opcao_mei, data_opcao_mei FROM "{db_schema}"."simples"')
+cnae_df    = fetch_lookup(conn, 'cnae',    f'SELECT codigo, descricao FROM "{db_schema}"."cnae"')
+natju_df   = fetch_lookup(conn, 'natju',   f'SELECT codigo, descricao FROM "{db_schema}"."natju"')
+munic_df   = fetch_lookup(conn, 'munic',   f'SELECT codigo, descricao FROM "{db_schema}"."munic"')
+
+# Normaliza chaves de JOIN para Utf8
+empresa_df = empresa_df.with_columns([
+    pl.col('cnpj_basico').cast(pl.Utf8),
+    pl.col('natureza_juridica').cast(pl.Utf8),
+])
+simples_df = simples_df.with_columns(pl.col('cnpj_basico').cast(pl.Utf8))
+cnae_df    = cnae_df.rename({'codigo': 'cnae_fiscal_principal', 'descricao': 'desc_cnae_principal'}).with_columns(pl.col('cnae_fiscal_principal').cast(pl.Utf8))
+natju_df   = natju_df.rename({'codigo': 'natureza_juridica', 'descricao': 'desc_natureza_juridica'}).with_columns(pl.col('natureza_juridica').cast(pl.Utf8))
+munic_df   = munic_df.rename({'codigo': 'municipio', 'descricao': 'nome_municipio'}).with_columns(pl.col('municipio').cast(pl.Utf8))
+
+print(f"Lookups prontos em {round(time.time()-lookup_start)}s")
+
+# Conexão separada para escrita (COPY) — conn não pode commitar durante o cursor de leitura
+conn_write = psycopg2.connect(DSN)
+
+ESTAB_COLS = [
+    'cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'nome_fantasia',
+    'situacao_cadastral', 'data_situacao_cadastral', 'data_inicio_atividade',
+    'cnae_fiscal_principal', 'identificador_matriz_filial',
+    'logradouro', 'numero', 'complemento', 'bairro', 'cep',
+    'uf', 'municipio', 'ddd_1', 'telefone_1', 'correio_eletronico',
+]
+FINAL_COLS = [
+    'cnpj', 'cnpj_basico', 'razao_social', 'nome_fantasia',
+    'situacao_cadastral', 'data_situacao_cadastral', 'data_inicio_atividade',
+    'cnae_fiscal_principal', 'desc_cnae_principal',
+    'natureza_juridica', 'desc_natureza_juridica',
+    'capital_social', 'porte_empresa',
+    'opcao_pelo_simples', 'data_opcao_simples',
+    'opcao_mei', 'data_opcao_mei',
+    'identificador_mf',
+    'logradouro', 'numero', 'complemento', 'bairro', 'cep',
+    'uf', 'municipio', 'nome_municipio',
+    'ddd_1', 'telefone_1', 'correio_eletronico',
+]
 
 CHUNK_SIZE = 500_000
-offset = 0
 chunk_num = 0
+total_inserted = 0
 
-while offset < total_rows:
-    chunk_num += 1
-    chunk_start = time.time()
-    print(f"  Chunk {chunk_num}: offset={offset:,} / {total_rows:,}...", flush=True)
+# Server-side cursor: stream sem OFFSET, PostgreSQL mantém posição
+with conn.cursor('estab_stream') as sc:
+    sc.itersize = CHUNK_SIZE
+    sc.execute(f'SELECT {", ".join(ESTAB_COLS)} FROM "{db_schema}"."estabelecimento"')
 
-    cur.execute(f"""
-        INSERT INTO "{db_schema}"."cnpj_consolidado" (
-            cnpj, cnpj_basico, razao_social, nome_fantasia,
-            situacao_cadastral, data_situacao_cadastral, data_inicio_atividade,
-            cnae_fiscal_principal, desc_cnae_principal,
-            natureza_juridica, desc_natureza_juridica,
-            capital_social, porte_empresa,
-            opcao_pelo_simples, data_opcao_simples,
-            opcao_mei, data_opcao_mei,
-            identificador_mf,
-            logradouro, numero, complemento, bairro, cep,
-            uf, municipio, nome_municipio,
-            ddd_1, telefone_1, correio_eletronico
+    while True:
+        rows = sc.fetchmany(CHUNK_SIZE)
+        if not rows:
+            break
+
+        chunk_num += 1
+        t0 = time.time()
+
+        chunk_df = pl.DataFrame(
+            {col: [r[i] for r in rows] for i, col in enumerate(ESTAB_COLS)}
         )
-        SELECT
-            es.cnpj_basico || es.cnpj_ordem || es.cnpj_dv,
-            es.cnpj_basico,
-            emp.razao_social,
-            es.nome_fantasia,
-            es.situacao_cadastral,
-            es.data_situacao_cadastral,
-            es.data_inicio_atividade,
-            es.cnae_fiscal_principal,
-            c.descricao,
-            emp.natureza_juridica,
-            nj.descricao,
-            emp.capital_social,
-            emp.porte_empresa,
-            si.opcao_pelo_simples,
-            si.data_opcao_simples,
-            si.opcao_mei,
-            si.data_opcao_mei,
-            es.identificador_matriz_filial,
-            es.logradouro,
-            es.numero,
-            es.complemento,
-            es.bairro,
-            es.cep,
-            es.uf,
-            es.municipio,
-            mu.descricao,
-            es.ddd_1,
-            es.telefone_1,
-            es.correio_eletronico
-        FROM (
-            SELECT * FROM "{db_schema}"."estabelecimento"
-            ORDER BY cnpj_basico, cnpj_ordem, cnpj_dv
-            LIMIT {CHUNK_SIZE} OFFSET {offset}
-        ) es
-        LEFT JOIN "{db_schema}"."empresa" emp ON emp.cnpj_basico       = es.cnpj_basico
-        LEFT JOIN "{db_schema}"."cnae"    c   ON c.codigo              = es.cnae_fiscal_principal
-        LEFT JOIN "{db_schema}"."natju"   nj  ON nj.codigo             = emp.natureza_juridica
-        LEFT JOIN "{db_schema}"."munic"   mu  ON mu.codigo             = es.municipio
-        LEFT JOIN "{db_schema}"."simples" si  ON si.cnpj_basico        = es.cnpj_basico
-        ON CONFLICT (cnpj) DO NOTHING;
-    """)
-    conn.commit()
+        del rows
+        gc.collect()
 
-    chunk_secs = round(time.time() - chunk_start)
-    print(f"  Chunk {chunk_num} concluído em {chunk_secs}s", flush=True)
-    offset += CHUNK_SIZE
+        # Cast chaves de JOIN para Utf8
+        chunk_df = chunk_df.with_columns([
+            pl.col('cnpj_basico').cast(pl.Utf8),
+            pl.col('cnpj_ordem').cast(pl.Utf8),
+            pl.col('cnpj_dv').cast(pl.Utf8),
+            pl.col('cnae_fiscal_principal').cast(pl.Utf8),
+            pl.col('municipio').cast(pl.Utf8),
+        ])
+
+        # Constrói CNPJ completo e renomeia identificador
+        chunk_df = chunk_df.with_columns(
+            (pl.col('cnpj_basico') + pl.col('cnpj_ordem') + pl.col('cnpj_dv')).alias('cnpj')
+        ).rename({'identificador_matriz_filial': 'identificador_mf'})
+
+        # JOIN em memória (sub-segundo por chunk)
+        result = (
+            chunk_df
+            .join(empresa_df, on='cnpj_basico', how='left')
+            .join(simples_df, on='cnpj_basico', how='left')
+            .join(cnae_df,    on='cnae_fiscal_principal', how='left')
+            .join(natju_df,   on='natureza_juridica', how='left')
+            .join(munic_df,   on='municipio', how='left')
+            .select(FINAL_COLS)
+        )
+
+        to_sql(result, 'cnpj_consolidado', conn_write, db_schema)
+        total_inserted += len(result)
+        print(f"  Chunk {chunk_num}: {total_inserted:,} inseridos ({round(time.time()-t0)}s)", flush=True)
+        del chunk_df, result
+        gc.collect()
+
+conn.commit()  # fecha o named cursor
+conn_write.close()
 
 consolidado_end = time.time()
 print(f"cnpj_consolidado populado com sucesso! Tempo (segundos): {round(consolidado_end - consolidado_start)}")
