@@ -356,7 +356,7 @@ ESTAB_INT_COLS = ['identificador_matriz_filial', 'situacao_cadastral', 'data_sit
                   'motivo_situacao_cadastral', 'data_inicio_atividade', 'cnae_fiscal_principal',
                   'municipio', 'data_situacao_especial']
 
-NROWS = 2_000_000
+NROWS = 500_000
 
 for arquivo in arquivos_estabelecimento:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
@@ -436,7 +436,7 @@ SIMPLES_COLS = ['cnpj_basico', 'opcao_pelo_simples', 'data_opcao_simples',
 
 SIMPLES_INT_COLS = ['data_opcao_simples', 'data_exclusao_simples', 'data_opcao_mei', 'data_exclusao_mei']
 
-NROWS_SIMPLES = 1_000_000
+NROWS_SIMPLES = 500_000
 
 for arquivo in arquivos_simples:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
@@ -647,6 +647,8 @@ consolidado_start = time.time()
 
 cur.execute(f'TRUNCATE TABLE "{db_schema}"."cnpj_consolidado";')
 conn.commit()
+
+cur.execute("SET work_mem = '1GB';")
 
 cur.execute(f"""
     INSERT INTO "{db_schema}"."cnpj_consolidado" (
