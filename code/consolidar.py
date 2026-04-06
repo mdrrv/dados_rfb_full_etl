@@ -3,10 +3,11 @@ Script standalone: popula cnpj_consolidado via Polars (JOIN em memória).
 Usa as tabelas fonte já existentes no banco — não faz download nem re-insert.
 
 Estratégia:
-  1. COPY TO para exportar lookups (empresa, simples, cnae, natju, munic) como CSV
-  2. Polars lê os CSVs via Arrow (muito mais rápido que fetchmany Python)
-  3. Stream de estabelecimento via server-side cursor, JOIN no Polars por chunk
-  4. COPY FROM para inserir resultado
+  1. Cria TEMP TABLEs deduplicadas no PostgreSQL (empresa_dedup, simples_dedup)
+     via DISTINCT ON — sem escrever CSV grande no disco
+  2. Carrega as temp tables (~22M linhas cada) no Polars via fetchmany
+  3. Stream de estabelecimento via named cursor, JOIN no Polars por chunk
+  4. COPY FROM para inserir resultado em cnpj_consolidado
 
 Uso:
     cd /root/dados_rfb_full_etl
@@ -58,20 +59,39 @@ def to_sql(df: pl.DataFrame, table_name: str, conn, schema: str):
     cur.close()
 
 
-def export_lookup_csv(conn, name, query, csv_path):
-    """Exporta query para CSV usando COPY TO (muito mais rápido que fetchmany)."""
-    t0 = time.time()
-    # Usa COPY (query) TO para exportar direto para arquivo no servidor
+def load_table_polars(conn, query, chunk_size=2_000_000):
+    """Carrega resultado de query no Polars via fetchmany (client-side cursor)."""
+    parts = []
+    with conn.cursor() as c:
+        c.execute(query)
+        cols = [d[0] for d in c.description]
+        while True:
+            rows = c.fetchmany(chunk_size)
+            if not rows:
+                break
+            parts.append(pl.DataFrame(
+                {col: [r[i] for r in rows] for i, col in enumerate(cols)},
+                schema={col: pl.Utf8 for col in cols}
+            ))
+            del rows
+            gc.collect()
+    return pl.concat(parts) if parts else pl.DataFrame()
+
+
+def export_small_csv(conn, name, query, csv_path):
+    """Exporta tabela pequena via COPY TO CSV."""
+    if os.path.isfile(csv_path):
+        print(f"  {name}: CSV já existe, pulando.", flush=True)
+        return
     with conn.cursor() as c:
         copy_sql = f"COPY ({query}) TO STDOUT WITH (FORMAT CSV, HEADER TRUE, NULL '')"
         with open(csv_path, 'w', encoding='utf-8') as f:
             c.copy_expert(copy_sql, f)
-    rows = sum(1 for _ in open(csv_path)) - 1  # conta linhas menos header
-    print(f"  {name}: {rows:,} linhas exportadas em {round(time.time()-t0)}s → {csv_path}", flush=True)
+    print(f"  {name}: exportado → {csv_path}", flush=True)
 
 
 # ── conexões ─────────────────────────────────────────────────────────────────
-conn       = psycopg2.connect(DSN)  # leitura
+conn       = psycopg2.connect(DSN)  # leitura (stream)
 conn_write = psycopg2.connect(DSN)  # escrita (COPY)
 
 # ── truncate ─────────────────────────────────────────────────────────────────
@@ -80,74 +100,64 @@ with conn.cursor() as c:
     c.execute(f'TRUNCATE TABLE "{db_schema}"."cnpj_consolidado";')
 conn.commit()
 
-# ── exporta lookups para CSV (pula se já existirem) ─────────────────────────
-lookups = {
-    'empresa': f'SELECT cnpj_basico, razao_social, natureza_juridica, capital_social, porte_empresa FROM "{db_schema}"."empresa"',
-    'simples': f'SELECT cnpj_basico, opcao_pelo_simples, data_opcao_simples, opcao_mei, data_opcao_mei FROM "{db_schema}"."simples"',
-    'cnae':    f'SELECT codigo, descricao FROM "{db_schema}"."cnae"',
-    'natju':   f'SELECT codigo, descricao FROM "{db_schema}"."natju"',
-    'munic':   f'SELECT codigo, descricao FROM "{db_schema}"."munic"',
-}
-
-all_exist = all(os.path.isfile(f'{TMP_DIR}/{name}.csv') for name in lookups)
-if all_exist:
-    print("CSVs de lookup já existem em /tmp, pulando exportação.", flush=True)
-else:
-    print("\nExportando lookups para CSV (COPY TO)...")
-    t0 = time.time()
-    for name, query in lookups.items():
-        export_lookup_csv(conn, name, query, f'{TMP_DIR}/{name}.csv')
-    print(f"CSVs exportados em {round(time.time()-t0)}s\n", flush=True)
-
-# ── carrega lookups no Polars (Arrow, muito mais rápido) ──────────────────────
-def stream_dedup_csv(src, dst, key_col=0):
-    """
-    Lê src linha a linha, mantém apenas a primeira ocorrência de cada chave.
-    Usa apenas um set de strings na RAM (muito menor que um DataFrame completo).
-    """
-    seen = set()
-    written = 0
-    with open(src, 'r', encoding='utf-8', errors='replace') as fin, \
-         open(dst, 'w', encoding='utf-8') as fout:
-        header = fin.readline()
-        fout.write(header)
-        for line in fin:
-            key = line.split(',')[key_col]
-            if key not in seen:
-                seen.add(key)
-                fout.write(line)
-                written += 1
-    return written
-
-
-print("Deduplicando CSVs de lookup (streaming — baixo uso de RAM)...", flush=True)
+# ── cria TEMP TABLEs deduplicadas no PostgreSQL ───────────────────────────────
+# Muito mais eficiente que exportar CSV de 67M linhas para disco.
+# PostgreSQL usa seu próprio temp tablespace (em /var/lib/postgresql).
+print("\nCriando tabelas temporárias deduplicadas no PostgreSQL...", flush=True)
 t0 = time.time()
 
-emp_dedup = f'{TMP_DIR}/empresa_dedup.csv'
-sim_dedup = f'{TMP_DIR}/simples_dedup.csv'
+with conn.cursor() as c:
+    print("  Criando empresa_dedup (DISTINCT ON cnpj_basico)...", flush=True)
+    c.execute(f"""
+        CREATE TEMP TABLE empresa_dedup AS
+        SELECT DISTINCT ON (cnpj_basico)
+            cnpj_basico, razao_social, natureza_juridica, capital_social, porte_empresa
+        FROM "{db_schema}"."empresa"
+        ORDER BY cnpj_basico;
+    """)
+    conn.commit()
+    c.execute("SELECT COUNT(*) FROM empresa_dedup")
+    n_emp = c.fetchone()[0]
+    print(f"  empresa_dedup: {n_emp:,} linhas ({round(time.time()-t0)}s)", flush=True)
 
-n_emp = stream_dedup_csv(f'{TMP_DIR}/empresa.csv', emp_dedup, key_col=0)
-print(f"  empresa: {n_emp:,} únicos", flush=True)
-gc.collect()
+    t1 = time.time()
+    print("  Criando simples_dedup (DISTINCT ON cnpj_basico)...", flush=True)
+    c.execute(f"""
+        CREATE TEMP TABLE simples_dedup AS
+        SELECT DISTINCT ON (cnpj_basico)
+            cnpj_basico, opcao_pelo_simples, data_opcao_simples, opcao_mei, data_opcao_mei
+        FROM "{db_schema}"."simples"
+        ORDER BY cnpj_basico;
+    """)
+    conn.commit()
+    c.execute("SELECT COUNT(*) FROM simples_dedup")
+    n_sim = c.fetchone()[0]
+    print(f"  simples_dedup: {n_sim:,} linhas ({round(time.time()-t1)}s)", flush=True)
 
-n_sim = stream_dedup_csv(f'{TMP_DIR}/simples.csv', sim_dedup, key_col=0)
-print(f"  simples: {n_sim:,} únicos", flush=True)
-gc.collect()
+print(f"Temp tables prontas em {round(time.time()-t0)}s\n", flush=True)
 
-print(f"Dedup concluído em {round(time.time()-t0)}s\n", flush=True)
+# ── exporta lookups pequenos para CSV ────────────────────────────────────────
+export_small_csv(conn, 'cnae',  f'SELECT codigo, descricao FROM "{db_schema}"."cnae"',  f'{TMP_DIR}/cnae.csv')
+export_small_csv(conn, 'natju', f'SELECT codigo, descricao FROM "{db_schema}"."natju"', f'{TMP_DIR}/natju.csv')
+export_small_csv(conn, 'munic', f'SELECT codigo, descricao FROM "{db_schema}"."munic"', f'{TMP_DIR}/munic.csv')
 
-print("Carregando lookups deduplificados no Polars...", flush=True)
+# ── carrega lookups no Polars ─────────────────────────────────────────────────
+print("\nCarregando lookups dedup no Polars...", flush=True)
 t0 = time.time()
 
-empresa_df = pl.read_csv(emp_dedup, infer_schema_length=0)
+empresa_df = load_table_polars(conn, "SELECT * FROM empresa_dedup")
 gc.collect()
-simples_df = pl.read_csv(sim_dedup, infer_schema_length=0)
+print(f"  empresa: {len(empresa_df):,}", flush=True)
+
+simples_df = load_table_polars(conn, "SELECT * FROM simples_dedup")
 gc.collect()
+print(f"  simples: {len(simples_df):,}", flush=True)
+
 cnae_df  = pl.read_csv(f'{TMP_DIR}/cnae.csv',  infer_schema_length=0).rename({'codigo': 'cnae_fiscal_principal', 'descricao': 'desc_cnae_principal'})
 natju_df = pl.read_csv(f'{TMP_DIR}/natju.csv',  infer_schema_length=0).rename({'codigo': 'natureza_juridica',     'descricao': 'desc_natureza_juridica'})
 munic_df = pl.read_csv(f'{TMP_DIR}/munic.csv',  infer_schema_length=0).rename({'codigo': 'municipio',             'descricao': 'nome_municipio'})
 
-print(f"  empresa: {len(empresa_df):,} | simples: {len(simples_df):,} | cnae: {len(cnae_df):,} | natju: {len(natju_df):,} | munic: {len(munic_df):,}", flush=True)
+print(f"  cnae: {len(cnae_df):,} | natju: {len(natju_df):,} | munic: {len(munic_df):,}", flush=True)
 print(f"Lookups prontos em {round(time.time()-t0)}s\n", flush=True)
 
 # ── stream estabelecimento + join + copy ──────────────────────────────────────
@@ -191,7 +201,6 @@ with conn.cursor('estab_stream') as sc:
         chunk_num += 1
         tc = time.time()
 
-        # Constrói DataFrame diretamente de listas Python (sem named cursor)
         chunk_df = pl.DataFrame(
             {col: [r[i] for r in rows] for i, col in enumerate(ESTAB_COLS)},
             schema={col: pl.Utf8 for col in ESTAB_COLS},
@@ -224,11 +233,11 @@ conn.commit()
 conn_write.close()
 conn.close()
 
-# Limpa CSVs temporários
-for f in ['empresa.csv', 'simples.csv', 'cnae.csv', 'natju.csv', 'munic.csv']:
+# Limpa CSVs temporários pequenos
+for f in ['cnae.csv', 'natju.csv', 'munic.csv']:
     try:
         os.remove(f'{TMP_DIR}/{f}')
-    except:
+    except Exception:
         pass
 
 total_secs = round(time.time() - start)
