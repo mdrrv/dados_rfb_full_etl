@@ -648,61 +648,83 @@ consolidado_start = time.time()
 cur.execute(f'TRUNCATE TABLE "{db_schema}"."cnpj_consolidado";')
 conn.commit()
 
-cur.execute("SET work_mem = '1GB';")
+cur.execute("SET work_mem = '256MB';")
 
-cur.execute(f"""
-    INSERT INTO "{db_schema}"."cnpj_consolidado" (
-        cnpj, cnpj_basico, razao_social, nome_fantasia,
-        situacao_cadastral, data_situacao_cadastral, data_inicio_atividade,
-        cnae_fiscal_principal, desc_cnae_principal,
-        natureza_juridica, desc_natureza_juridica,
-        capital_social, porte_empresa,
-        opcao_pelo_simples, data_opcao_simples,
-        opcao_mei, data_opcao_mei,
-        identificador_mf,
-        logradouro, numero, complemento, bairro, cep,
-        uf, municipio, nome_municipio,
-        ddd_1, telefone_1, correio_eletronico
-    )
-    SELECT
-        es.cnpj_basico || es.cnpj_ordem || es.cnpj_dv,
-        es.cnpj_basico,
-        emp.razao_social,
-        es.nome_fantasia,
-        es.situacao_cadastral,
-        es.data_situacao_cadastral,
-        es.data_inicio_atividade,
-        es.cnae_fiscal_principal,
-        c.descricao,
-        emp.natureza_juridica,
-        nj.descricao,
-        emp.capital_social,
-        emp.porte_empresa,
-        si.opcao_pelo_simples,
-        si.data_opcao_simples,
-        si.opcao_mei,
-        si.data_opcao_mei,
-        es.identificador_matriz_filial,
-        es.logradouro,
-        es.numero,
-        es.complemento,
-        es.bairro,
-        es.cep,
-        es.uf,
-        es.municipio,
-        mu.descricao,
-        es.ddd_1,
-        es.telefone_1,
-        es.correio_eletronico
-    FROM "{db_schema}"."estabelecimento" es
-    LEFT JOIN "{db_schema}"."empresa" emp ON emp.cnpj_basico       = es.cnpj_basico
-    LEFT JOIN "{db_schema}"."cnae"    c   ON c.codigo              = es.cnae_fiscal_principal
-    LEFT JOIN "{db_schema}"."natju"   nj  ON nj.codigo             = emp.natureza_juridica
-    LEFT JOIN "{db_schema}"."munic"   mu  ON mu.codigo             = es.municipio
-    LEFT JOIN "{db_schema}"."simples" si  ON si.cnpj_basico        = es.cnpj_basico
-    ON CONFLICT (cnpj) DO NOTHING;
-""")
-conn.commit()
+# Conta total de registros em estabelecimento para controle do progresso
+cur.execute(f'SELECT COUNT(*) FROM "{db_schema}"."estabelecimento";')
+total_rows = cur.fetchone()[0]
+print(f"Total de estabelecimentos: {total_rows:,}")
+
+CHUNK_SIZE = 500_000
+offset = 0
+chunk_num = 0
+
+while offset < total_rows:
+    chunk_num += 1
+    chunk_start = time.time()
+    print(f"  Chunk {chunk_num}: offset={offset:,} / {total_rows:,}...", flush=True)
+
+    cur.execute(f"""
+        INSERT INTO "{db_schema}"."cnpj_consolidado" (
+            cnpj, cnpj_basico, razao_social, nome_fantasia,
+            situacao_cadastral, data_situacao_cadastral, data_inicio_atividade,
+            cnae_fiscal_principal, desc_cnae_principal,
+            natureza_juridica, desc_natureza_juridica,
+            capital_social, porte_empresa,
+            opcao_pelo_simples, data_opcao_simples,
+            opcao_mei, data_opcao_mei,
+            identificador_mf,
+            logradouro, numero, complemento, bairro, cep,
+            uf, municipio, nome_municipio,
+            ddd_1, telefone_1, correio_eletronico
+        )
+        SELECT
+            es.cnpj_basico || es.cnpj_ordem || es.cnpj_dv,
+            es.cnpj_basico,
+            emp.razao_social,
+            es.nome_fantasia,
+            es.situacao_cadastral,
+            es.data_situacao_cadastral,
+            es.data_inicio_atividade,
+            es.cnae_fiscal_principal,
+            c.descricao,
+            emp.natureza_juridica,
+            nj.descricao,
+            emp.capital_social,
+            emp.porte_empresa,
+            si.opcao_pelo_simples,
+            si.data_opcao_simples,
+            si.opcao_mei,
+            si.data_opcao_mei,
+            es.identificador_matriz_filial,
+            es.logradouro,
+            es.numero,
+            es.complemento,
+            es.bairro,
+            es.cep,
+            es.uf,
+            es.municipio,
+            mu.descricao,
+            es.ddd_1,
+            es.telefone_1,
+            es.correio_eletronico
+        FROM (
+            SELECT * FROM "{db_schema}"."estabelecimento"
+            ORDER BY cnpj_basico, cnpj_ordem, cnpj_dv
+            LIMIT {CHUNK_SIZE} OFFSET {offset}
+        ) es
+        LEFT JOIN "{db_schema}"."empresa" emp ON emp.cnpj_basico       = es.cnpj_basico
+        LEFT JOIN "{db_schema}"."cnae"    c   ON c.codigo              = es.cnae_fiscal_principal
+        LEFT JOIN "{db_schema}"."natju"   nj  ON nj.codigo             = emp.natureza_juridica
+        LEFT JOIN "{db_schema}"."munic"   mu  ON mu.codigo             = es.municipio
+        LEFT JOIN "{db_schema}"."simples" si  ON si.cnpj_basico        = es.cnpj_basico
+        ON CONFLICT (cnpj) DO NOTHING;
+    """)
+    conn.commit()
+
+    chunk_secs = round(time.time() - chunk_start)
+    print(f"  Chunk {chunk_num} concluído em {chunk_secs}s", flush=True)
+    offset += CHUNK_SIZE
 
 consolidado_end = time.time()
 print(f"cnpj_consolidado populado com sucesso! Tempo (segundos): {round(consolidado_end - consolidado_start)}")
