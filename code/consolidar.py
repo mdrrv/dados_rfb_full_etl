@@ -50,10 +50,10 @@ conn.commit()
 # ── verifica índice em estabelecimento ───────────────────────────────────────
 print("Verificando índice em estabelecimento.cnpj_basico...", flush=True)
 with conn.cursor() as c:
-    c.execute(f"""
+    c.execute("""
         SELECT indexname FROM pg_indexes
         WHERE schemaname = %s AND tablename = 'estabelecimento'
-        AND indexdef LIKE '%cnpj_basico%'
+        AND indexdef LIKE '%%cnpj_basico%%'
         LIMIT 1;
     """, (db_schema,))
     idx = c.fetchone()
