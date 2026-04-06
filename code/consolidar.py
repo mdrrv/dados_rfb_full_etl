@@ -80,28 +80,72 @@ with conn.cursor() as c:
     c.execute(f'TRUNCATE TABLE "{db_schema}"."cnpj_consolidado";')
 conn.commit()
 
-# ── exporta lookups para CSV ──────────────────────────────────────────────────
-print("\nExportando lookups para CSV (COPY TO)...")
-t0 = time.time()
+# ── exporta lookups para CSV (pula se já existirem) ─────────────────────────
+lookups = {
+    'empresa': f'SELECT cnpj_basico, razao_social, natureza_juridica, capital_social, porte_empresa FROM "{db_schema}"."empresa"',
+    'simples': f'SELECT cnpj_basico, opcao_pelo_simples, data_opcao_simples, opcao_mei, data_opcao_mei FROM "{db_schema}"."simples"',
+    'cnae':    f'SELECT codigo, descricao FROM "{db_schema}"."cnae"',
+    'natju':   f'SELECT codigo, descricao FROM "{db_schema}"."natju"',
+    'munic':   f'SELECT codigo, descricao FROM "{db_schema}"."munic"',
+}
 
-# DISTINCT para deduplificar caso tabela tenha sido carregada múltiplas vezes
-export_lookup_csv(conn, 'empresa', f'SELECT DISTINCT ON (cnpj_basico) cnpj_basico, razao_social, natureza_juridica, capital_social, porte_empresa FROM "{db_schema}"."empresa" ORDER BY cnpj_basico', f'{TMP_DIR}/empresa.csv')
-export_lookup_csv(conn, 'simples', f'SELECT DISTINCT ON (cnpj_basico) cnpj_basico, opcao_pelo_simples, data_opcao_simples, opcao_mei, data_opcao_mei FROM "{db_schema}"."simples" ORDER BY cnpj_basico', f'{TMP_DIR}/simples.csv')
-export_lookup_csv(conn, 'cnae',   f'SELECT codigo, descricao FROM "{db_schema}"."cnae"',  f'{TMP_DIR}/cnae.csv')
-export_lookup_csv(conn, 'natju',  f'SELECT codigo, descricao FROM "{db_schema}"."natju"', f'{TMP_DIR}/natju.csv')
-export_lookup_csv(conn, 'munic',  f'SELECT codigo, descricao FROM "{db_schema}"."munic"', f'{TMP_DIR}/munic.csv')
-
-print(f"CSVs exportados em {round(time.time()-t0)}s\n", flush=True)
+all_exist = all(os.path.isfile(f'{TMP_DIR}/{name}.csv') for name in lookups)
+if all_exist:
+    print("CSVs de lookup já existem em /tmp, pulando exportação.", flush=True)
+else:
+    print("\nExportando lookups para CSV (COPY TO)...")
+    t0 = time.time()
+    for name, query in lookups.items():
+        export_lookup_csv(conn, name, query, f'{TMP_DIR}/{name}.csv')
+    print(f"CSVs exportados em {round(time.time()-t0)}s\n", flush=True)
 
 # ── carrega lookups no Polars (Arrow, muito mais rápido) ──────────────────────
-print("Carregando lookups no Polars...", flush=True)
+def stream_dedup_csv(src, dst, key_col=0):
+    """
+    Lê src linha a linha, mantém apenas a primeira ocorrência de cada chave.
+    Usa apenas um set de strings na RAM (muito menor que um DataFrame completo).
+    """
+    seen = set()
+    written = 0
+    with open(src, 'r', encoding='utf-8', errors='replace') as fin, \
+         open(dst, 'w', encoding='utf-8') as fout:
+        header = fin.readline()
+        fout.write(header)
+        for line in fin:
+            key = line.split(',')[key_col]
+            if key not in seen:
+                seen.add(key)
+                fout.write(line)
+                written += 1
+    return written
+
+
+print("Deduplicando CSVs de lookup (streaming — baixo uso de RAM)...", flush=True)
 t0 = time.time()
 
-empresa_df = pl.read_csv(f'{TMP_DIR}/empresa.csv', infer_schema_length=0)
-simples_df = pl.read_csv(f'{TMP_DIR}/simples.csv', infer_schema_length=0)
-cnae_df    = pl.read_csv(f'{TMP_DIR}/cnae.csv',    infer_schema_length=0).rename({'codigo': 'cnae_fiscal_principal', 'descricao': 'desc_cnae_principal'})
-natju_df   = pl.read_csv(f'{TMP_DIR}/natju.csv',   infer_schema_length=0).rename({'codigo': 'natureza_juridica',     'descricao': 'desc_natureza_juridica'})
-munic_df   = pl.read_csv(f'{TMP_DIR}/munic.csv',   infer_schema_length=0).rename({'codigo': 'municipio',             'descricao': 'nome_municipio'})
+emp_dedup = f'{TMP_DIR}/empresa_dedup.csv'
+sim_dedup = f'{TMP_DIR}/simples_dedup.csv'
+
+n_emp = stream_dedup_csv(f'{TMP_DIR}/empresa.csv', emp_dedup, key_col=0)
+print(f"  empresa: {n_emp:,} únicos", flush=True)
+gc.collect()
+
+n_sim = stream_dedup_csv(f'{TMP_DIR}/simples.csv', sim_dedup, key_col=0)
+print(f"  simples: {n_sim:,} únicos", flush=True)
+gc.collect()
+
+print(f"Dedup concluído em {round(time.time()-t0)}s\n", flush=True)
+
+print("Carregando lookups deduplificados no Polars...", flush=True)
+t0 = time.time()
+
+empresa_df = pl.read_csv(emp_dedup, infer_schema_length=0)
+gc.collect()
+simples_df = pl.read_csv(sim_dedup, infer_schema_length=0)
+gc.collect()
+cnae_df  = pl.read_csv(f'{TMP_DIR}/cnae.csv',  infer_schema_length=0).rename({'codigo': 'cnae_fiscal_principal', 'descricao': 'desc_cnae_principal'})
+natju_df = pl.read_csv(f'{TMP_DIR}/natju.csv',  infer_schema_length=0).rename({'codigo': 'natureza_juridica',     'descricao': 'desc_natureza_juridica'})
+munic_df = pl.read_csv(f'{TMP_DIR}/munic.csv',  infer_schema_length=0).rename({'codigo': 'municipio',             'descricao': 'nome_municipio'})
 
 print(f"  empresa: {len(empresa_df):,} | simples: {len(simples_df):,} | cnae: {len(cnae_df):,} | natju: {len(natju_df):,} | munic: {len(munic_df):,}", flush=True)
 print(f"Lookups prontos em {round(time.time()-t0)}s\n", flush=True)
