@@ -2,6 +2,12 @@
 Script standalone: popula cnpj_consolidado via Polars (JOIN em memória).
 Usa as tabelas fonte já existentes no banco — não faz download nem re-insert.
 
+Estratégia:
+  1. COPY TO para exportar lookups (empresa, simples, cnae, natju, munic) como CSV
+  2. Polars lê os CSVs via Arrow (muito mais rápido que fetchmany Python)
+  3. Stream de estabelecimento via server-side cursor, JOIN no Polars por chunk
+  4. COPY FROM para inserir resultado
+
 Uso:
     cd /root/dados_rfb_full_etl
     source /root/etl_venv/bin/activate
@@ -35,6 +41,9 @@ db_schema = os.getenv('DB_SCHEMA')
 
 DSN = f"dbname={database} user={user} host={host} port={port} password={password}"
 
+TMP_DIR = '/tmp/consolidar_lookups'
+os.makedirs(TMP_DIR, exist_ok=True)
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 def to_sql(df: pl.DataFrame, table_name: str, conn, schema: str):
     cur = conn.cursor()
@@ -49,61 +58,55 @@ def to_sql(df: pl.DataFrame, table_name: str, conn, schema: str):
     cur.close()
 
 
-def fetch_lookup(conn, name, query, chunk_size=1_000_000):
-    """Carrega tabela de lookup no Polars via cursor client-side com fetchmany."""
-    parts = []
-    # Cursor sem nome = client-side: description disponível logo após execute()
-    with conn.cursor() as lc:
-        lc.execute(query)
-        cols = [d[0] for d in lc.description]
-        while True:
-            rows = lc.fetchmany(chunk_size)
-            if not rows:
-                break
-            data = {col: [r[i] for r in rows] for i, col in enumerate(cols)}
-            parts.append(pl.DataFrame(data))
-            del rows, data
-    if not parts:
-        return pl.DataFrame()
-    df = pl.concat(parts)
-    del parts
-    gc.collect()
-    print(f"  {name}: {len(df):,} linhas", flush=True)
-    return df
+def export_lookup_csv(conn, name, query, csv_path):
+    """Exporta query para CSV usando COPY TO (muito mais rápido que fetchmany)."""
+    t0 = time.time()
+    # Usa COPY (query) TO para exportar direto para arquivo no servidor
+    with conn.cursor() as c:
+        copy_sql = f"COPY ({query}) TO STDOUT WITH (FORMAT CSV, HEADER TRUE, NULL '')"
+        with open(csv_path, 'w', encoding='utf-8') as f:
+            c.copy_expert(copy_sql, f)
+    rows = sum(1 for _ in open(csv_path)) - 1  # conta linhas menos header
+    print(f"  {name}: {rows:,} linhas exportadas em {round(time.time()-t0)}s → {csv_path}", flush=True)
 
 
 # ── conexões ─────────────────────────────────────────────────────────────────
-conn      = psycopg2.connect(DSN)  # leitura (named cursor)
+conn       = psycopg2.connect(DSN)  # leitura
 conn_write = psycopg2.connect(DSN)  # escrita (COPY)
-cur       = conn.cursor()
 
 # ── truncate ─────────────────────────────────────────────────────────────────
 print("Truncando cnpj_consolidado...", flush=True)
-cur.execute(f'TRUNCATE TABLE "{db_schema}"."cnpj_consolidado";')
+with conn.cursor() as c:
+    c.execute(f'TRUNCATE TABLE "{db_schema}"."cnpj_consolidado";')
 conn.commit()
 
-# ── lookups ──────────────────────────────────────────────────────────────────
-print("\nCarregando lookups na memória (Polars)...")
+# ── exporta lookups para CSV ──────────────────────────────────────────────────
+print("\nExportando lookups para CSV (COPY TO)...")
 t0 = time.time()
 
-empresa_df = fetch_lookup(conn, 'empresa', f'SELECT cnpj_basico, razao_social, natureza_juridica, capital_social, porte_empresa FROM "{db_schema}"."empresa"')
-simples_df = fetch_lookup(conn, 'simples', f'SELECT cnpj_basico, opcao_pelo_simples, data_opcao_simples, opcao_mei, data_opcao_mei FROM "{db_schema}"."simples"')
-cnae_df    = fetch_lookup(conn, 'cnae',    f'SELECT codigo, descricao FROM "{db_schema}"."cnae"')
-natju_df   = fetch_lookup(conn, 'natju',   f'SELECT codigo, descricao FROM "{db_schema}"."natju"')
-munic_df   = fetch_lookup(conn, 'munic',   f'SELECT codigo, descricao FROM "{db_schema}"."munic"')
+# DISTINCT para deduplificar caso tabela tenha sido carregada múltiplas vezes
+export_lookup_csv(conn, 'empresa', f'SELECT DISTINCT ON (cnpj_basico) cnpj_basico, razao_social, natureza_juridica, capital_social, porte_empresa FROM "{db_schema}"."empresa" ORDER BY cnpj_basico', f'{TMP_DIR}/empresa.csv')
+export_lookup_csv(conn, 'simples', f'SELECT DISTINCT ON (cnpj_basico) cnpj_basico, opcao_pelo_simples, data_opcao_simples, opcao_mei, data_opcao_mei FROM "{db_schema}"."simples" ORDER BY cnpj_basico', f'{TMP_DIR}/simples.csv')
+export_lookup_csv(conn, 'cnae',   f'SELECT codigo, descricao FROM "{db_schema}"."cnae"',  f'{TMP_DIR}/cnae.csv')
+export_lookup_csv(conn, 'natju',  f'SELECT codigo, descricao FROM "{db_schema}"."natju"', f'{TMP_DIR}/natju.csv')
+export_lookup_csv(conn, 'munic',  f'SELECT codigo, descricao FROM "{db_schema}"."munic"', f'{TMP_DIR}/munic.csv')
 
-empresa_df = empresa_df.with_columns([
-    pl.col('cnpj_basico').cast(pl.Utf8),
-    pl.col('natureza_juridica').cast(pl.Utf8),
-])
-simples_df = simples_df.with_columns(pl.col('cnpj_basico').cast(pl.Utf8))
-cnae_df    = cnae_df.rename({'codigo': 'cnae_fiscal_principal', 'descricao': 'desc_cnae_principal'}).with_columns(pl.col('cnae_fiscal_principal').cast(pl.Utf8))
-natju_df   = natju_df.rename({'codigo': 'natureza_juridica', 'descricao': 'desc_natureza_juridica'}).with_columns(pl.col('natureza_juridica').cast(pl.Utf8))
-munic_df   = munic_df.rename({'codigo': 'municipio', 'descricao': 'nome_municipio'}).with_columns(pl.col('municipio').cast(pl.Utf8))
+print(f"CSVs exportados em {round(time.time()-t0)}s\n", flush=True)
 
+# ── carrega lookups no Polars (Arrow, muito mais rápido) ──────────────────────
+print("Carregando lookups no Polars...", flush=True)
+t0 = time.time()
+
+empresa_df = pl.read_csv(f'{TMP_DIR}/empresa.csv', infer_schema_length=0)
+simples_df = pl.read_csv(f'{TMP_DIR}/simples.csv', infer_schema_length=0)
+cnae_df    = pl.read_csv(f'{TMP_DIR}/cnae.csv',    infer_schema_length=0).rename({'codigo': 'cnae_fiscal_principal', 'descricao': 'desc_cnae_principal'})
+natju_df   = pl.read_csv(f'{TMP_DIR}/natju.csv',   infer_schema_length=0).rename({'codigo': 'natureza_juridica',     'descricao': 'desc_natureza_juridica'})
+munic_df   = pl.read_csv(f'{TMP_DIR}/munic.csv',   infer_schema_length=0).rename({'codigo': 'municipio',             'descricao': 'nome_municipio'})
+
+print(f"  empresa: {len(empresa_df):,} | simples: {len(simples_df):,} | cnae: {len(cnae_df):,} | natju: {len(natju_df):,} | munic: {len(munic_df):,}", flush=True)
 print(f"Lookups prontos em {round(time.time()-t0)}s\n", flush=True)
 
-# ── stream + join + copy ──────────────────────────────────────────────────────
+# ── stream estabelecimento + join + copy ──────────────────────────────────────
 ESTAB_COLS = [
     'cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'nome_fantasia',
     'situacao_cadastral', 'data_situacao_cadastral', 'data_inicio_atividade',
@@ -125,10 +128,12 @@ FINAL_COLS = [
     'ddd_1', 'telefone_1', 'correio_eletronico',
 ]
 
-CHUNK_SIZE    = 500_000
-chunk_num     = 0
+CHUNK_SIZE     = 500_000
+chunk_num      = 0
 total_inserted = 0
-start         = time.time()
+start          = time.time()
+
+print("Iniciando stream de estabelecimento...", flush=True)
 
 with conn.cursor('estab_stream') as sc:
     sc.itersize = CHUNK_SIZE
@@ -142,19 +147,15 @@ with conn.cursor('estab_stream') as sc:
         chunk_num += 1
         tc = time.time()
 
+        # Constrói DataFrame diretamente de listas Python (sem named cursor)
         chunk_df = pl.DataFrame(
-            {col: [r[i] for r in rows] for i, col in enumerate(ESTAB_COLS)}
+            {col: [r[i] for r in rows] for i, col in enumerate(ESTAB_COLS)},
+            schema={col: pl.Utf8 for col in ESTAB_COLS},
         )
         del rows
         gc.collect()
 
-        chunk_df = chunk_df.with_columns([
-            pl.col('cnpj_basico').cast(pl.Utf8),
-            pl.col('cnpj_ordem').cast(pl.Utf8),
-            pl.col('cnpj_dv').cast(pl.Utf8),
-            pl.col('cnae_fiscal_principal').cast(pl.Utf8),
-            pl.col('municipio').cast(pl.Utf8),
-        ]).with_columns(
+        chunk_df = chunk_df.with_columns(
             (pl.col('cnpj_basico') + pl.col('cnpj_ordem') + pl.col('cnpj_dv')).alias('cnpj')
         ).rename({'identificador_matriz_filial': 'identificador_mf'})
 
@@ -178,6 +179,13 @@ with conn.cursor('estab_stream') as sc:
 conn.commit()
 conn_write.close()
 conn.close()
+
+# Limpa CSVs temporários
+for f in ['empresa.csv', 'simples.csv', 'cnae.csv', 'natju.csv', 'munic.csv']:
+    try:
+        os.remove(f'{TMP_DIR}/{f}')
+    except:
+        pass
 
 total_secs = round(time.time() - start)
 print(f"\ncnpj_consolidado populado! {total_inserted:,} registros em {total_secs}s ({round(total_secs/60)}min)")
