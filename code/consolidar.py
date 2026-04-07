@@ -192,7 +192,49 @@ for digit in range(10):
     total_inserted += n
     print(f"{n:,} inseridos ({round(time.time()-t0)}s) — total: {total_inserted:,}", flush=True)
 
-conn.close()
-
 total_secs = round(time.time() - start)
 print(f"\ncnpj_consolidado populado! {total_inserted:,} registros em {total_secs}s ({round(total_secs/60)}min)")
+
+# ── índices pós-consolidação ──────────────────────────────────────────────────
+INDEXES = [
+    ("idx_cnpj_consolidado_cnpj_basico", "cnpj_consolidado", "cnpj_basico"),
+    ("idx_cnpj_consolidado_razao_trgm",  None,               None),          # trigrama — criado separadamente
+    ("idx_consolidado_cep",              "cnpj_consolidado", "cep"),
+    ("idx_consolidado_email",            "cnpj_consolidado", "correio_eletronico"),
+    ("idx_consolidado_cnae",             "cnpj_consolidado", "cnae_fiscal_principal"),
+    ("idx_socios_cpf_cnpj",              "socios",           "cpf_cnpj_socio"),
+]
+
+conn2 = psycopg2.connect(DSN)
+conn2.autocommit = True  # CREATE INDEX não pode rodar dentro de transação
+
+print("\nVerificando índices...", flush=True)
+for idx_name, table, column in INDEXES:
+    if table is None:
+        # índice trigrama: verificar existência mas não recriar aqui
+        with conn2.cursor() as c:
+            c.execute("SELECT 1 FROM pg_indexes WHERE schemaname = %s AND indexname = %s", (db_schema, idx_name))
+            if not c.fetchone():
+                print(f"  AVISO: {idx_name} não existe — crie manualmente com pg_trgm extension.", flush=True)
+            else:
+                print(f"  OK: {idx_name}", flush=True)
+        continue
+
+    with conn2.cursor() as c:
+        c.execute(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = %s AND tablename = %s AND indexname = %s",
+            (db_schema, table, idx_name)
+        )
+        exists = c.fetchone()
+
+    if exists:
+        print(f"  OK: {idx_name}", flush=True)
+    else:
+        print(f"  Criando {idx_name} em {table}.{column}...", end=' ', flush=True)
+        t0 = time.time()
+        with conn2.cursor() as c:
+            c.execute(f'CREATE INDEX IF NOT EXISTS {idx_name} ON "{db_schema}"."{table}" ({column});')
+        print(f"({round(time.time()-t0)}s)", flush=True)
+
+conn2.close()
+print("\nÍndices OK.", flush=True)
