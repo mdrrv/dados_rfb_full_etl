@@ -84,6 +84,11 @@ def main():
     cur.execute(DDL_FK)
     conn.commit()
 
+    print("Limpando tabela pessoas para reprocessamento...")
+    cur.execute(f'UPDATE "{SCHEMA}".socios SET pessoa_id = NULL')
+    cur.execute(f'TRUNCATE "{SCHEMA}".pessoas')
+    conn.commit()
+
     print("Carregando distinct cpf_cnpj_socio + nome...")
     cur.execute(f"""
         SELECT cpf_cnpj_socio, nome_socio_razao_social
@@ -94,13 +99,16 @@ def main():
     rows = cur.fetchall()
     print(f"  {len(rows):,} combinações únicas encontradas")
 
-    # Deduplica por cpf_cnpj: mantém o nome mais frequente (primeiro na ordem do GROUP BY)
-    seen: dict[str, tuple[uuid.UUID, str]] = {}
+    # Chave de identidade: (cpf_cnpj + nome) — CPF mascarado não é único por pessoa
+    # O mesmo padrão ***052458** pode representar centenas de pessoas distintas
+    seen: dict[tuple[str, str], tuple[uuid.UUID, str]] = {}
     for cpf_cnpj, nome in rows:
-        if cpf_cnpj not in seen:
-            uid = uuid.uuid5(UUID_NAMESPACE, cpf_cnpj)
-            slug = make_slug(uid, nome or cpf_cnpj)
-            seen[cpf_cnpj] = (uid, nome or "", slug)
+        nome_clean = (nome or "").strip().upper()
+        key = (cpf_cnpj, nome_clean)
+        if key not in seen:
+            uid = uuid.uuid5(UUID_NAMESPACE, f"{cpf_cnpj}|{nome_clean}")
+            slug = make_slug(uid, nome_clean or cpf_cnpj)
+            seen[key] = (uid, nome_clean, slug)
 
     print(f"  {len(seen):,} pessoas únicas após deduplicação")
 
@@ -110,7 +118,7 @@ def main():
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (id) DO NOTHING
     """
-    batch = [(str(uid), cpf, nome, slug) for cpf, (uid, nome, slug) in seen.items()]
+    batch = [(str(uid), cpf, nome, slug) for (cpf, _), (uid, nome, slug) in seen.items()]
     cur.executemany(insert_sql, batch)
     conn.commit()
     print(f"  {cur.rowcount:,} linhas inseridas")
@@ -121,6 +129,7 @@ def main():
         SET pessoa_id = p.id
         FROM "{SCHEMA}".pessoas p
         WHERE s.cpf_cnpj_socio = p.cpf_cnpj
+          AND UPPER(TRIM(s.nome_socio_razao_social)) = p.nome
           AND s.pessoa_id IS NULL
     """)
     conn.commit()
