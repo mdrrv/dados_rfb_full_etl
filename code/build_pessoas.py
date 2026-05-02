@@ -65,8 +65,11 @@ CREATE INDEX IF NOT EXISTS idx_pessoas_cpf_cnpj ON "{SCHEMA}".pessoas (cpf_cnpj)
 CREATE INDEX IF NOT EXISTS idx_pessoas_slug    ON "{SCHEMA}".pessoas (slug);
 """
 
-# pessoa_id em socios é otimização futura — não rodar com backend ativo (lock exclusivo)
-DDL_FK = None
+DDL_FK = f"""
+ALTER TABLE "{SCHEMA}".socios
+    ADD COLUMN IF NOT EXISTS pessoa_id UUID;
+CREATE INDEX IF NOT EXISTS idx_socios_pessoa_id ON "{SCHEMA}".socios (pessoa_id);
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -78,8 +81,7 @@ def main():
 
     print("Criando tabela pessoas e coluna socios.pessoa_id...")
     cur.execute(DDL_PESSOAS)
-    if DDL_FK:
-        cur.execute(DDL_FK)
+    cur.execute(DDL_FK)
     conn.commit()
 
     print("Limpando para reprocessamento...")
