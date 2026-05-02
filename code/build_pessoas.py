@@ -84,8 +84,9 @@ def main():
     cur.execute(DDL_FK)
     conn.commit()
 
-    print("Limpando tabela pessoas para reprocessamento...")
-    cur.execute(f'UPDATE "{SCHEMA}".socios SET pessoa_id = NULL')
+    print("Limpando para reprocessamento...")
+    # DROP COLUMN é DDL — instantâneo, evita UPDATE full-scan em 27M linhas
+    cur.execute(f'ALTER TABLE "{SCHEMA}".socios DROP COLUMN IF EXISTS pessoa_id')
     cur.execute(f'TRUNCATE "{SCHEMA}".pessoas')
     conn.commit()
 
