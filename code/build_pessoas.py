@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_pessoas_slug    ON "{SCHEMA}".pessoas (slug);
 
 DDL_FK = f"""
 ALTER TABLE "{SCHEMA}".socios
-    ADD COLUMN IF NOT EXISTS pessoa_id UUID REFERENCES "{SCHEMA}".pessoas(id);
+    ADD COLUMN IF NOT EXISTS pessoa_id UUID;
 CREATE INDEX IF NOT EXISTS idx_socios_pessoa_id ON "{SCHEMA}".socios (pessoa_id);
 """
 
