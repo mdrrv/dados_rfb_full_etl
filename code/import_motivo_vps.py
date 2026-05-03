@@ -3,6 +3,11 @@ Passo 2/2 — roda na VPS.
 Importa motivo_cnpj.csv.gz (gerado pelo export_motivo_local.py) e atualiza
 a coluna motivo_situacao_cadastral em cnpj_consolidado.
 
+Estratégia:
+  - Cria tabela permanente com índice (não temp) para o join ser O(n) com index lookup
+  - UPDATE em 100 batches por prefixo de cnpj_basico — cada batch commita sozinho,
+    banco fica responsivo, pode ser interrompido e retomado sem perda
+
 Uso:
     cd /root/app/dados_rfb_full_etl
     nohup python3 -u code/import_motivo_vps.py /tmp/motivo_cnpj.csv.gz > /root/motivo_import.log 2>&1 &
@@ -33,7 +38,6 @@ load_dotenv(_find_dotenv(), override=True)
 
 db_schema = os.getenv("DB_SCHEMA", "dados_rfb")
 
-# Arquivo de entrada — aceita como argumento ou usa padrão
 csv_gz = sys.argv[1] if len(sys.argv) > 1 else "/tmp/motivo_cnpj.csv.gz"
 if not os.path.isfile(csv_gz):
     raise SystemExit(f"ERRO: arquivo não encontrado: {csv_gz}")
@@ -52,7 +56,7 @@ conn = psycopg2.connect(
 cur = conn.cursor()
 print("Conectado.\n")
 
-# ── 1. Coluna ─────────────────────────────────────────────────────────────────
+# ── 1. Coluna (idempotente) ───────────────────────────────────────────────────
 cur.execute(f"""
     ALTER TABLE "{db_schema}"."cnpj_consolidado"
     ADD COLUMN IF NOT EXISTS motivo_situacao_cadastral VARCHAR(2);
@@ -60,72 +64,85 @@ cur.execute(f"""
 conn.commit()
 print("Coluna motivo_situacao_cadastral: OK")
 
-# ── 2. Temp table ─────────────────────────────────────────────────────────────
-cur.execute("DROP TABLE IF EXISTS _tmp_motivo;")
-cur.execute("""
-    CREATE TEMP TABLE _tmp_motivo (
-        cnpj                      TEXT,
+# ── 2. Tabela de mapeamento permanente com índice ─────────────────────────────
+# Permanente (não TEMP) para sobreviver a reconexões e suportar índice eficiente
+cur.execute(f'DROP TABLE IF EXISTS "{db_schema}"."_map_motivo";')
+cur.execute(f"""
+    CREATE TABLE "{db_schema}"."_map_motivo" (
+        cnpj                      TEXT PRIMARY KEY,
         motivo_situacao_cadastral VARCHAR(2)
     );
 """)
 conn.commit()
+print("Tabela _map_motivo criada.")
 
-# ── 3. COPY em chunks para não estourar memória ───────────────────────────────
-print(f"Carregando {csv_gz} na temp table...", flush=True)
+# ── 3. COPY em chunks ─────────────────────────────────────────────────────────
+print(f"Carregando {csv_gz}...", flush=True)
 CHUNK = 500_000
 buf_lines = []
 total = 0
 t0 = time.time()
 
 with gzip.open(csv_gz, "rt", encoding="utf-8") as f:
-    header = f.readline()  # pula o header
+    f.readline()  # header
     for line in f:
         buf_lines.append(line)
         if len(buf_lines) >= CHUNK:
             cur2 = conn.cursor()
             cur2.copy_expert(
-                "COPY _tmp_motivo (cnpj, motivo_situacao_cadastral) FROM STDIN WITH (FORMAT CSV, NULL '')",
+                f'COPY "{db_schema}"."_map_motivo" (cnpj, motivo_situacao_cadastral) '
+                "FROM STDIN WITH (FORMAT CSV, NULL '')",
                 StringIO("".join(buf_lines)),
             )
             conn.commit()
             cur2.close()
             total += len(buf_lines)
             buf_lines = []
-            print(f"  {total:,} linhas carregadas ({round(time.time()-t0)}s)", flush=True)
+            print(f"  {total:,} linhas ({round(time.time()-t0)}s)", flush=True)
 
 if buf_lines:
     cur2 = conn.cursor()
     cur2.copy_expert(
-        "COPY _tmp_motivo (cnpj, motivo_situacao_cadastral) FROM STDIN WITH (FORMAT CSV, NULL '')",
+        f'COPY "{db_schema}"."_map_motivo" (cnpj, motivo_situacao_cadastral) '
+        "FROM STDIN WITH (FORMAT CSV, NULL '')",
         StringIO("".join(buf_lines)),
     )
     conn.commit()
     cur2.close()
     total += len(buf_lines)
 
-print(f"Temp table: {total:,} registros em {round(time.time()-t0)}s\n")
+print(f"_map_motivo: {total:,} registros em {round(time.time()-t0)}s")
 
-# ── 4. UPDATE ─────────────────────────────────────────────────────────────────
-print("Executando UPDATE em cnpj_consolidado... (pode levar 10-30 min)", flush=True)
-t0 = time.time()
-cur.execute(f"""
-    UPDATE "{db_schema}"."cnpj_consolidado" cc
-    SET    motivo_situacao_cadastral = t.motivo_situacao_cadastral
-    FROM  (
-        SELECT DISTINCT ON (cnpj) cnpj, motivo_situacao_cadastral
-        FROM   _tmp_motivo
-        ORDER  BY cnpj
-    ) t
-    WHERE  cc.cnpj = t.cnpj;
-""")
-updated = cur.rowcount
+# ── 4. UPDATE em 100 batches por prefixo de cnpj_basico ──────────────────────
+# Cada batch afeta ~280k linhas, commita sozinho, banco fica responsivo
+print("\nIniciando UPDATE em 100 batches...", flush=True)
+total_updated = 0
+start = time.time()
+
+for i in range(100):
+    prefix = f"{i:02d}"
+    t0 = time.time()
+    cur.execute(f"""
+        UPDATE "{db_schema}"."cnpj_consolidado" cc
+        SET    motivo_situacao_cadastral = m.motivo_situacao_cadastral
+        FROM   "{db_schema}"."_map_motivo" m
+        WHERE  cc.cnpj = m.cnpj
+          AND  cc.cnpj_basico LIKE %s
+          AND  cc.motivo_situacao_cadastral IS NULL;
+    """, (f"{prefix}%",))
+    n = cur.rowcount
+    conn.commit()
+    total_updated += n
+    print(f"  Batch {prefix}: {n:,} atualizados ({round(time.time()-t0)}s) — total: {total_updated:,}", flush=True)
+
+print(f"\nUPDATE concluído: {total_updated:,} registros em {round(time.time()-start)}s")
+
+# ── 5. Limpeza da tabela de mapeamento ───────────────────────────────────────
+cur.execute(f'DROP TABLE IF EXISTS "{db_schema}"."_map_motivo";')
 conn.commit()
-print(f"UPDATE: {updated:,} registros ({round(time.time()-t0)}s)\n")
+print("Tabela _map_motivo removida.")
 
-cur.execute("DROP TABLE IF EXISTS _tmp_motivo;")
-conn.commit()
-
-# ── 5. Verificação ────────────────────────────────────────────────────────────
+# ── 6. Verificação ────────────────────────────────────────────────────────────
 cur.execute(f"""
     SELECT motivo_situacao_cadastral, COUNT(*) n
     FROM "{db_schema}"."cnpj_consolidado"
@@ -133,14 +150,13 @@ cur.execute(f"""
       AND motivo_situacao_cadastral NOT IN ('0', '00')
     GROUP BY 1 ORDER BY 2 DESC LIMIT 10;
 """)
-print("Top motivos (excluindo 00):")
+print("\nTop motivos (excluindo 00):")
 for motivo, n in cur.fetchall():
     print(f"  {motivo}: {n:,}")
 
 cur.close()
 conn.close()
 
-# ── 6. Remove o arquivo temporário ───────────────────────────────────────────
 os.remove(csv_gz)
 print(f"\nArquivo {csv_gz} removido.")
 print("Concluído.")
