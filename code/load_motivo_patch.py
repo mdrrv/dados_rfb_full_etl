@@ -5,10 +5,15 @@ Lê apenas os arquivos ESTABELE* (já extraídos), extrai somente cnpj + motivo,
 carrega em tabela temporária e faz UPDATE no cnpj_consolidado.
 Muito mais rápido e barato em disco do que reprocessar o ETL completo.
 
+Uso na VPS:
+    cd /root/app/dados_rfb_full_etl
+    nohup python3 -u code/load_motivo_patch.py > /root/motivo_patch.log 2>&1 &
+
 Pré-requisito: arquivos ESTABE*.* extraídos em EXTRACTED_FILES_PATH (definido no .env)
 """
 import os
 import pathlib
+import shutil
 import time
 from io import StringIO
 
@@ -16,39 +21,55 @@ import polars as pl
 import psycopg2
 from dotenv import load_dotenv
 
+
 def _find_dotenv() -> str:
-    candidate = pathlib.Path().resolve() / ".env"
-    if candidate.is_file():
-        return str(candidate)
+    # Busca .env no diretório atual e nos pais (até 4 níveis)
+    p = pathlib.Path().resolve()
+    for _ in range(5):
+        candidate = p / ".env"
+        if candidate.is_file():
+            return str(candidate)
+        p = p.parent
+    # Não encontrou — pede ao usuário
     while True:
         raw = input("Informe o caminho do .env (arquivo ou pasta): ").strip().strip("'\"")
         if raw.startswith("#") or not raw:
-            continue  # ignorar comentários e linhas vazias acidentais
+            continue
         p = pathlib.Path(raw)
         path = p if p.name == ".env" else p / ".env"
         if path.is_file():
             return str(path)
         print(f"  Arquivo não encontrado: {path}")
 
+
 dotenv_path = _find_dotenv()
-load_dotenv(dotenv_path=dotenv_path, override=True)  # override garante que env vars do shell não bloqueiam
+load_dotenv(dotenv_path=dotenv_path, override=True)
 
 db_host = os.getenv("DB_HOST")
-print(f"Conectando em: {db_host}:{os.getenv('DB_PORT')} / {os.getenv('DB_NAME')}")
-if not db_host:
-    raise SystemExit("ERRO: DB_HOST não carregado. Verifique o caminho do .env.")
-
-extracted_files = os.getenv("EXTRACTED_FILES_PATH")
+db_port = os.getenv("DB_PORT", "5432")
+db_name = os.getenv("DB_NAME")
+db_user = os.getenv("DB_USER")
+db_pass = os.getenv("DB_PASSWORD")
 db_schema = os.getenv("DB_SCHEMA", "dados_rfb")
+extracted_files = os.getenv("EXTRACTED_FILES_PATH")
+output_files = os.getenv("OUTPUT_FILES_PATH")
 
+print(f"Config:  {dotenv_path}")
+print(f"Banco:   {db_host}:{db_port} / {db_name}")
+print(f"Arquivos extraídos: {extracted_files}")
+
+if not db_host:
+    raise SystemExit("ERRO: DB_HOST não carregado. Verifique o .env.")
+if not extracted_files or not os.path.isdir(extracted_files):
+    raise SystemExit(f"ERRO: EXTRACTED_FILES_PATH inválido: {extracted_files}")
+
+# ── Conexão ──────────────────────────────────────────────────────────────────
 conn = psycopg2.connect(
-    dbname=os.getenv("DB_NAME"),
-    user=os.getenv("DB_USER"),
-    host=os.getenv("DB_HOST"),
-    port=os.getenv("DB_PORT"),
-    password=os.getenv("DB_PASSWORD"),
+    dbname=db_name, user=db_user, host=db_host,
+    port=db_port, password=db_pass, connect_timeout=30,
 )
 cur = conn.cursor()
+print("Conectado.\n")
 
 # ── 1. Adicionar coluna (idempotente) ────────────────────────────────────────
 cur.execute(f"""
@@ -58,17 +79,17 @@ cur.execute(f"""
 conn.commit()
 print("Coluna motivo_situacao_cadastral: OK")
 
-# ── 2. Criar temp table (sem PK para tolerar duplicatas nos arquivos brutos) ──
+# ── 2. Temp table ─────────────────────────────────────────────────────────────
 cur.execute("DROP TABLE IF EXISTS _tmp_motivo;")
 cur.execute("""
     CREATE TEMP TABLE _tmp_motivo (
-        cnpj               TEXT,
+        cnpj                      TEXT,
         motivo_situacao_cadastral VARCHAR(2)
     );
 """)
 conn.commit()
 
-# Layout completo do arquivo de estabelecimento (necessário para new_columns)
+# Layout completo do arquivo de estabelecimento
 # pos 0: cnpj_basico | 1: cnpj_ordem | 2: cnpj_dv | 7: motivo_situacao_cadastral
 ALL_ESTAB_COLS = [
     'cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'identificador_matriz_filial',
@@ -83,13 +104,13 @@ ALL_ESTAB_COLS = [
 
 arquivos = sorted([f for f in os.listdir(extracted_files) if "ESTABELE" in f.upper()])
 if not arquivos:
-    print(f"Nenhum arquivo ESTABE* encontrado em: {extracted_files}")
-    raise SystemExit(1)
+    raise SystemExit(f"ERRO: Nenhum arquivo ESTABELE* encontrado em: {extracted_files}")
 
 print(f"{len(arquivos)} arquivo(s) de estabelecimento encontrado(s).")
 total_tmp = 0
 start = time.time()
 
+# ── 3. Leitura e carga na temp table ─────────────────────────────────────────
 for arquivo in arquivos:
     path = os.path.join(extracted_files, arquivo)
     t0 = time.time()
@@ -121,11 +142,10 @@ for arquivo in arquivos:
 
 print(f"\nTemp table: {total_tmp:,} registros em {round(time.time()-start)}s")
 
-# ── 3. UPDATE no cnpj_consolidado ────────────────────────────────────────────
+# ── 4. UPDATE no cnpj_consolidado ────────────────────────────────────────────
 print("Executando UPDATE em cnpj_consolidado... ", end="", flush=True)
 t0 = time.time()
 
-# DISTINCT ON para resolver eventuais duplicatas nos arquivos brutos
 cur.execute(f"""
     UPDATE "{db_schema}"."cnpj_consolidado" cc
     SET    motivo_situacao_cadastral = t.motivo_situacao_cadastral
@@ -143,13 +163,12 @@ print(f"{updated:,} registros atualizados ({round(time.time()-t0)}s)")
 cur.execute("DROP TABLE IF EXISTS _tmp_motivo;")
 conn.commit()
 
-# ── 4. Verificação ────────────────────────────────────────────────────────────
+# ── 5. Verificação ────────────────────────────────────────────────────────────
 cur.execute(f"""
     SELECT motivo_situacao_cadastral, COUNT(*) AS n
     FROM "{db_schema}"."cnpj_consolidado"
     WHERE motivo_situacao_cadastral IS NOT NULL
-      AND motivo_situacao_cadastral <> '0'
-      AND motivo_situacao_cadastral <> '00'
+      AND motivo_situacao_cadastral NOT IN ('0', '00')
     GROUP BY 1
     ORDER BY 2 DESC
     LIMIT 10;
@@ -161,4 +180,25 @@ for motivo, n in rows:
 
 cur.close()
 conn.close()
+
+# ── 6. Limpeza dos arquivos de extração ──────────────────────────────────────
+print("\nLimpando arquivos extraídos...")
+removidos = 0
+for pasta in filter(None, [extracted_files, output_files]):
+    if not os.path.isdir(pasta):
+        continue
+    for f in os.listdir(pasta):
+        fp = os.path.join(pasta, f)
+        try:
+            if os.path.isfile(fp):
+                os.remove(fp)
+                removidos += 1
+            elif os.path.isdir(fp):
+                shutil.rmtree(fp)
+                removidos += 1
+        except Exception as e:
+            print(f"  Aviso: não foi possível remover {fp}: {e}")
+    print(f"  {pasta}: limpo")
+
+print(f"  {removidos} item(ns) removido(s).")
 print("\nConcluído.")
