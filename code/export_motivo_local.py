@@ -8,12 +8,12 @@ Uso:
     python code/export_motivo_local.py
     # Depois: scp <output>/motivo_cnpj.csv.gz root@187.127.13.118:/tmp/
 """
+import csv
 import gzip
 import os
 import pathlib
 import time
 
-import polars as pl
 from dotenv import load_dotenv
 
 
@@ -43,16 +43,8 @@ output_path     = os.getenv("OUTPUT_FILES_PATH", ".")
 if not extracted_files or not os.path.isdir(extracted_files):
     raise SystemExit(f"ERRO: EXTRACTED_FILES_PATH inválido: {extracted_files}")
 
-ALL_ESTAB_COLS = [
-    'cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'identificador_matriz_filial',
-    'nome_fantasia', 'situacao_cadastral', 'data_situacao_cadastral',
-    'motivo_situacao_cadastral', 'nome_cidade_exterior', 'pais',
-    'data_inicio_atividade', 'cnae_fiscal_principal', 'cnae_fiscal_secundaria',
-    'tipo_logradouro', 'logradouro', 'numero', 'complemento',
-    'bairro', 'cep', 'uf', 'municipio', 'ddd_1', 'telefone_1',
-    'ddd_2', 'telefone_2', 'correio_eletronico',
-    'situacao_especial', 'data_situacao_especial',
-]
+# Leitura linha a linha — sem carregar o arquivo inteiro na memória
+# pos 0: cnpj_basico | 1: cnpj_ordem | 2: cnpj_dv | 7: motivo_situacao_cadastral
 
 arquivos = sorted([f for f in os.listdir(extracted_files) if "ESTABELE" in f.upper()])
 if not arquivos:
@@ -69,22 +61,23 @@ with gzip.open(out_file, "wt", encoding="utf-8") as gz:
     for arquivo in arquivos:
         t0 = time.time()
         print(f"  {arquivo}... ", end="", flush=True)
+        count = 0
 
-        df = pl.read_csv(
-            os.path.join(extracted_files, arquivo),
-            separator=";",
-            has_header=False,
-            encoding="latin1",
-            infer_schema_length=0,
-            new_columns=ALL_ESTAB_COLS,
-        ).select([
-            (pl.col("cnpj_basico") + pl.col("cnpj_ordem") + pl.col("cnpj_dv")).alias("cnpj"),
-            pl.col("motivo_situacao_cadastral"),
-        ])
+        with open(os.path.join(extracted_files, arquivo), "rb") as raw:
+            reader = csv.reader(
+                (line.decode("latin1") for line in raw),
+                delimiter=";",
+            )
+            for row in reader:
+                if len(row) < 8:
+                    continue
+                cnpj   = row[0] + row[1] + row[2]
+                motivo = row[7]
+                gz.write(f"{cnpj},{motivo}\n")
+                count += 1
 
-        gz.write(df.write_csv(include_header=False))
-        total += len(df)
-        print(f"{len(df):,} linhas ({round(time.time()-t0)}s)", flush=True)
+        total += count
+        print(f"{count:,} linhas ({round(time.time()-t0)}s)", flush=True)
 
 size_mb = os.path.getsize(out_file) / 1024 / 1024
 print(f"\nArquivo gerado: {out_file}")
