@@ -16,12 +16,17 @@ import polars as pl
 import psycopg2
 from dotenv import load_dotenv
 
-current_path = pathlib.Path().resolve()
-dotenv_path = os.path.join(current_path, ".env")
-if not os.path.isfile(dotenv_path):
-    local_env = input("Informe o local do .env: ")
-    dotenv_path = os.path.join(local_env, ".env")
+def _find_dotenv() -> str:
+    candidate = pathlib.Path().resolve() / ".env"
+    if candidate.is_file():
+        return str(candidate)
+    raw = input("Informe o caminho do .env (arquivo ou pasta): ").strip().strip("'\"")
+    p = pathlib.Path(raw)
+    return str(p if p.suffix == ".env" or p.name == ".env" else p / ".env")
+
+dotenv_path = _find_dotenv()
 load_dotenv(dotenv_path=dotenv_path)
+print(f"Carregando config de: {dotenv_path}")
 
 extracted_files = os.getenv("EXTRACTED_FILES_PATH")
 db_schema = os.getenv("DB_SCHEMA", "dados_rfb")
