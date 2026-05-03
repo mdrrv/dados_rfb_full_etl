@@ -58,12 +58,17 @@ cur.execute("""
 """)
 conn.commit()
 
-# Layout do arquivo de estabelecimento — apenas as 8 primeiras colunas
+# Layout completo do arquivo de estabelecimento (necessário para new_columns)
 # pos 0: cnpj_basico | 1: cnpj_ordem | 2: cnpj_dv | 7: motivo_situacao_cadastral
 ALL_ESTAB_COLS = [
     'cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'identificador_matriz_filial',
     'nome_fantasia', 'situacao_cadastral', 'data_situacao_cadastral',
-    'motivo_situacao_cadastral',
+    'motivo_situacao_cadastral', 'nome_cidade_exterior', 'pais',
+    'data_inicio_atividade', 'cnae_fiscal_principal', 'cnae_fiscal_secundaria',
+    'tipo_logradouro', 'logradouro', 'numero', 'complemento',
+    'bairro', 'cep', 'uf', 'municipio', 'ddd_1', 'telefone_1',
+    'ddd_2', 'telefone_2', 'correio_eletronico',
+    'situacao_especial', 'data_situacao_especial',
 ]
 
 arquivos = sorted([f for f in os.listdir(extracted_files) if "ESTABELE" in f.upper()])
@@ -86,11 +91,8 @@ for arquivo in arquivos:
         has_header=False,
         encoding="latin1",
         infer_schema_length=0,
-        n_columns=8,                 # lê só as 8 primeiras colunas — ignora o resto
         new_columns=ALL_ESTAB_COLS,
-    )
-
-    df = df.select([
+    ).select([
         (pl.col("cnpj_basico") + pl.col("cnpj_ordem") + pl.col("cnpj_dv")).alias("cnpj"),
         pl.col("motivo_situacao_cadastral"),
     ])
