@@ -20,13 +20,23 @@ def _find_dotenv() -> str:
     candidate = pathlib.Path().resolve() / ".env"
     if candidate.is_file():
         return str(candidate)
-    raw = input("Informe o caminho do .env (arquivo ou pasta): ").strip().strip("'\"")
-    p = pathlib.Path(raw)
-    return str(p if p.suffix == ".env" or p.name == ".env" else p / ".env")
+    while True:
+        raw = input("Informe o caminho do .env (arquivo ou pasta): ").strip().strip("'\"")
+        if raw.startswith("#") or not raw:
+            continue  # ignorar comentários e linhas vazias acidentais
+        p = pathlib.Path(raw)
+        path = p if p.name == ".env" else p / ".env"
+        if path.is_file():
+            return str(path)
+        print(f"  Arquivo não encontrado: {path}")
 
 dotenv_path = _find_dotenv()
-load_dotenv(dotenv_path=dotenv_path)
-print(f"Carregando config de: {dotenv_path}")
+load_dotenv(dotenv_path=dotenv_path, override=True)  # override garante que env vars do shell não bloqueiam
+
+db_host = os.getenv("DB_HOST")
+print(f"Conectando em: {db_host}:{os.getenv('DB_PORT')} / {os.getenv('DB_NAME')}")
+if not db_host:
+    raise SystemExit("ERRO: DB_HOST não carregado. Verifique o caminho do .env.")
 
 extracted_files = os.getenv("EXTRACTED_FILES_PATH")
 db_schema = os.getenv("DB_SCHEMA", "dados_rfb")
