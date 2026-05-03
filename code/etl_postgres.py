@@ -1,3 +1,4 @@
+from csv import reader
 import datetime
 import gc
 import pathlib
@@ -356,41 +357,60 @@ ESTAB_INT_COLS = ['identificador_matriz_filial', 'situacao_cadastral', 'data_sit
                   'motivo_situacao_cadastral', 'data_inicio_atividade', 'cnae_fiscal_principal',
                   'municipio', 'data_situacao_especial']
 
-NROWS = 500_000
+NROWS = 250_000
 
 for arquivo in arquivos_estabelecimento:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
     extracted_file_path = os.path.join(extracted_files, arquivo)
+    
     skip = 0
     part = 0
     while True:
-        chunk = pl.read_csv(
-            extracted_file_path,
-            separator=';',
-            has_header=False,
-            encoding='latin1',
-            infer_schema_length=0,
-            new_columns=ESTAB_COLS,
-            n_rows=NROWS,
-            skip_rows=skip,
-        )
+        # Usamos o read_csv puro, mas com n_threads=1 para evitar erro de UTF-8
+        # e n_rows para controlar a memória.
+        try:
+            chunk = pl.read_csv(
+                extracted_file_path,
+                separator=';',
+                has_header=False,
+                encoding='latin1',         # Latin1 é mais resiliente no read_csv puro
+                infer_schema_length=0,
+                new_columns=ESTAB_COLS,
+                n_rows=NROWS,
+                skip_rows=skip,
+                truncate_ragged_lines=True, # Pula colunas extras se a linha estiver suja
+                n_threads=1                 # <--- O SEGREDO: evita o erro de 'invalid utf-8'
+            )
+        except Exception as e:
+            print(f"Erro ao ler chunk na linha {skip}: {e}")
+            break
+
         if chunk.is_empty():
             break
+
+        # Conversão de tipos
         chunk = chunk.with_columns([
             pl.col(c).cast(pl.Int32, strict=False) for c in ESTAB_INT_COLS
         ])
+
+        # Insere no SQL
         to_sql(chunk, 'estabelecimento', conn, db_schema)
         print(f"Arquivo {arquivo} / parte {part} inserida com sucesso!")
+
+        # Atualiza ponteiros
         skip += NROWS
         part += 1
+
+        # Se o chunk veio menor que o NROWS, chegamos ao fim do arquivo
         if len(chunk) < NROWS:
             del chunk
             break
+            
         del chunk
         gc.collect()
 
 estabelecimento_insert_end = time.time()
-print("Tempo de execução do processo de ESTABELECIMENTO (segundos):", round(estabelecimento_insert_end - estabelecimento_insert_start))
+print("Tempo total ESTABELECIMENTO:", round(estabelecimento_insert_end - estabelecimento_insert_start))
 
 #############################################
 # Processamento dos Arquivos de SÓCIOS
@@ -436,7 +456,7 @@ SIMPLES_COLS = ['cnpj_basico', 'opcao_pelo_simples', 'data_opcao_simples',
 
 SIMPLES_INT_COLS = ['data_opcao_simples', 'data_exclusao_simples', 'data_opcao_mei', 'data_exclusao_mei']
 
-NROWS_SIMPLES = 500_000
+NROWS_SIMPLES = 50_000
 
 for arquivo in arquivos_simples:
     print(f"Trabalhando no arquivo: {arquivo} [...]")
@@ -700,14 +720,14 @@ conn_write = psycopg2.connect(DSN)
 
 ESTAB_COLS = [
     'cnpj_basico', 'cnpj_ordem', 'cnpj_dv', 'nome_fantasia',
-    'situacao_cadastral', 'data_situacao_cadastral', 'data_inicio_atividade',
+    'situacao_cadastral', 'data_situacao_cadastral', 'motivo_situacao_cadastral', 'data_inicio_atividade',
     'cnae_fiscal_principal', 'identificador_matriz_filial',
     'logradouro', 'numero', 'complemento', 'bairro', 'cep',
     'uf', 'municipio', 'ddd_1', 'telefone_1', 'correio_eletronico',
 ]
 FINAL_COLS = [
     'cnpj', 'cnpj_basico', 'razao_social', 'nome_fantasia',
-    'situacao_cadastral', 'data_situacao_cadastral', 'data_inicio_atividade',
+    'situacao_cadastral', 'data_situacao_cadastral', 'motivo_situacao_cadastral', 'data_inicio_atividade',
     'cnae_fiscal_principal', 'desc_cnae_principal',
     'natureza_juridica', 'desc_natureza_juridica',
     'capital_social', 'porte_empresa',
@@ -719,7 +739,7 @@ FINAL_COLS = [
     'ddd_1', 'telefone_1', 'correio_eletronico',
 ]
 
-CHUNK_SIZE = 500_000
+CHUNK_SIZE = 50_000
 chunk_num = 0
 total_inserted = 0
 
@@ -742,13 +762,14 @@ with conn.cursor('estab_stream') as sc:
         del rows
         gc.collect()
 
-        # Cast chaves de JOIN para Utf8
+        # Cast chaves de JOIN e campos de texto para Utf8
         chunk_df = chunk_df.with_columns([
             pl.col('cnpj_basico').cast(pl.Utf8),
             pl.col('cnpj_ordem').cast(pl.Utf8),
             pl.col('cnpj_dv').cast(pl.Utf8),
             pl.col('cnae_fiscal_principal').cast(pl.Utf8),
             pl.col('municipio').cast(pl.Utf8),
+            pl.col('motivo_situacao_cadastral').cast(pl.Utf8),
         ])
 
         # Constrói CNPJ completo e renomeia identificador

@@ -2,7 +2,7 @@
 Script standalone: popula cnpj_consolidado em chunks por faixa de cnpj_basico.
 
 Estratégia: sem carregar empresa/simples na RAM.
-- Divide estabelecimento em 10 faixas por primeiro dígito de cnpj_basico (0-9)
+- Divide estabelecimento em 100 faixas pelos dois primeiros dígitos de cnpj_basico (00 a 99)
 - Para cada faixa: PostgreSQL faz o JOIN com índices, COPY TO STDOUT → Python
 - Python grava no cnpj_consolidado via COPY FROM STDIN
 
@@ -15,9 +15,7 @@ import os
 import pathlib
 import sys
 import time
-from io import StringIO, BytesIO
 
-import polars as pl
 import psycopg2
 from dotenv import load_dotenv
 
@@ -66,13 +64,17 @@ with conn.cursor() as c:
     else:
         print(f"  Índice encontrado: {idx[0]}", flush=True)
 
+# ── Aumento temporário de memória no DB para os JOINs ────────────────────────
+print("Ajustando work_mem da conexão para acelerar os joins...", flush=True)
+with conn.cursor() as c:
+    c.execute("SET work_mem = '256MB';")
+conn.commit()
+
 # ── JOIN por faixas de cnpj_basico ────────────────────────────────────────────
-# cnpj_basico é texto de 8 dígitos — primeiro dígito varia de '0' a '9'
-# Isso distribui os ~70M registros em ~10 chunks sem OFFSET
 
 FINAL_COLS = [
     'cnpj', 'cnpj_basico', 'razao_social', 'nome_fantasia',
-    'situacao_cadastral', 'data_situacao_cadastral', 'data_inicio_atividade',
+    'situacao_cadastral', 'data_situacao_cadastral', 'motivo_situacao_cadastral', 'data_inicio_atividade',
     'cnae_fiscal_principal', 'desc_cnae_principal',
     'natureza_juridica', 'desc_natureza_juridica',
     'capital_social', 'porte_empresa',
@@ -86,47 +88,6 @@ FINAL_COLS = [
 
 col_list = ', '.join(f'"{c}"' for c in FINAL_COLS)
 
-SELECT_SQL = f"""
-    SELECT
-        es.cnpj_basico || es.cnpj_ordem || es.cnpj_dv        AS cnpj,
-        es.cnpj_basico,
-        emp.razao_social,
-        es.nome_fantasia,
-        es.situacao_cadastral,
-        es.data_situacao_cadastral,
-        es.data_inicio_atividade,
-        es.cnae_fiscal_principal,
-        c.descricao                                           AS desc_cnae_principal,
-        emp.natureza_juridica,
-        nj.descricao                                          AS desc_natureza_juridica,
-        emp.capital_social,
-        emp.porte_empresa,
-        si.opcao_pelo_simples,
-        si.data_opcao_simples,
-        si.opcao_mei,
-        si.data_opcao_mei,
-        es.identificador_matriz_filial                        AS identificador_mf,
-        es.logradouro,
-        es.numero,
-        es.complemento,
-        es.bairro,
-        es.cep,
-        es.uf,
-        es.municipio,
-        mu.descricao                                          AS nome_municipio,
-        es.ddd_1,
-        es.telefone_1,
-        es.correio_eletronico
-    FROM "{db_schema}"."estabelecimento" es
-    LEFT JOIN "{db_schema}"."empresa" emp ON emp.cnpj_basico = es.cnpj_basico
-    LEFT JOIN "{db_schema}"."cnae"    c   ON c.codigo        = es.cnae_fiscal_principal
-    LEFT JOIN "{db_schema}"."natju"   nj  ON nj.codigo       = emp.natureza_juridica
-    LEFT JOIN "{db_schema}"."munic"   mu  ON mu.codigo       = es.municipio
-    LEFT JOIN "{db_schema}"."simples" si  ON si.cnpj_basico  = es.cnpj_basico
-    WHERE es.cnpj_basico LIKE %s
-    ON CONFLICT DO NOTHING
-"""
-
 COPY_SELECT = f"""
     SELECT
         es.cnpj_basico || es.cnpj_ordem || es.cnpj_dv        AS cnpj,
@@ -135,11 +96,12 @@ COPY_SELECT = f"""
         es.nome_fantasia,
         es.situacao_cadastral,
         es.data_situacao_cadastral,
+        es.motivo_situacao_cadastral,
         es.data_inicio_atividade,
         es.cnae_fiscal_principal,
-        c.descricao                                           AS desc_cnae_principal,
+        c.descricao                                          AS desc_cnae_principal,
         emp.natureza_juridica,
-        nj.descricao                                          AS desc_natureza_juridica,
+        nj.descricao                                         AS desc_natureza_juridica,
         emp.capital_social,
         emp.porte_empresa,
         si.opcao_pelo_simples,
@@ -154,7 +116,7 @@ COPY_SELECT = f"""
         es.cep,
         es.uf,
         es.municipio,
-        mu.descricao                                          AS nome_municipio,
+        mu.descricao                                         AS nome_municipio,
         es.ddd_1,
         es.telefone_1,
         es.correio_eletronico
@@ -173,18 +135,21 @@ INSERT_SQL = f"""
     ON CONFLICT (cnpj) DO NOTHING;
 """
 
-print("\nIniciando consolidação por faixa de cnpj_basico...", flush=True)
+print("\nIniciando consolidação em 100 pedaços (00 a 99)...", flush=True)
 total_inserted = 0
 start = time.time()
 
-for digit in range(10):
+for digit in range(100):
     t0 = time.time()
-    pattern = f"{digit}%"
-    print(f"  Faixa {digit}x... ", end='', flush=True)
+    
+    # FORMATADOR MÁGICO: Transforma 0 em "00", 1 em "01", etc.
+    digit_str = f"{digit:02d}" 
+    
+    print(f"  Faixa {digit_str}... ", end='', flush=True)
 
     with conn.cursor() as c:
         c.execute(
-            INSERT_SQL.replace('{digit}', str(digit))
+            INSERT_SQL.replace('{digit}', digit_str)
         )
         n = c.rowcount
         conn.commit()
@@ -194,6 +159,12 @@ for digit in range(10):
 
 total_secs = round(time.time() - start)
 print(f"\ncnpj_consolidado populado! {total_inserted:,} registros em {total_secs}s ({round(total_secs/60)}min)")
+
+# ── analyze ──────────────────────────────────────────────────────────────────
+print("\nAtualizando estatísticas do Postgres (ANALYZE)...", flush=True)
+with conn.cursor() as c:
+    c.execute(f'ANALYZE "{db_schema}"."cnpj_consolidado";')
+conn.commit()
 
 # ── índices pós-consolidação ──────────────────────────────────────────────────
 INDEXES = [
@@ -211,7 +182,6 @@ conn2.autocommit = True  # CREATE INDEX não pode rodar dentro de transação
 print("\nVerificando índices...", flush=True)
 for idx_name, table, column in INDEXES:
     if table is None:
-        # índice trigrama: verificar existência mas não recriar aqui
         with conn2.cursor() as c:
             c.execute("SELECT 1 FROM pg_indexes WHERE schemaname = %s AND indexname = %s", (db_schema, idx_name))
             if not c.fetchone():
@@ -237,4 +207,4 @@ for idx_name, table, column in INDEXES:
         print(f"({round(time.time()-t0)}s)", flush=True)
 
 conn2.close()
-print("\nÍndices OK.", flush=True)
+print("\nProcesso Finalizado com Sucesso!", flush=True)
