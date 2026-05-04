@@ -96,7 +96,7 @@ time.sleep(2)
 
 cmd = (
     f"cd {SCRIPT_DIR} && "
-    f"nohup python3 -u code/import_motivo_vps.py {REMOTE_GZ} "
+    f"nohup /root/venv-etl/bin/python3 -u code/import_motivo_vps.py {REMOTE_GZ} "
     f"> {LOG_FILE} 2>&1 & echo PID:$!"
 )
 _, stdout, _ = ssh.exec_command(cmd)
