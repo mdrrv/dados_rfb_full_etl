@@ -2,16 +2,16 @@
 ETL CEIS/CNEP — Portal da Transparência (CGU)
 Baixa, extrai e importa sanções federais para dados_rfb.sancoes_federais.
 """
-import os, io, csv, zipfile, requests, psycopg2
+import os, io, csv, zipfile, pathlib, requests, psycopg2
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=str(pathlib.Path().resolve() / ".env"))
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_NAME = os.getenv("DB_NAME", "rfb")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASS = os.getenv("DB_PASS", "")
+DB_HOST = os.getenv("DB_HOST", "187.127.13.118")
+DB_NAME = os.getenv("DB_NAME", "dados_rfb")
+DB_USER = os.getenv("DB_USER", "pguser")
+DB_PASS = os.getenv("DB_PASSWORD") or os.getenv("POSTGRES_PASSWORD", "")
 DB_PORT = int(os.getenv("DB_PORT", 5432))
 
 BASE_URL = "https://portaldatransparencia.gov.br/download-de-dados"
@@ -133,6 +133,12 @@ def process_zip(fonte: str, url: str, cur) -> int:
 
 
 def main():
+    import sys
+    # Usage: python etl_ceis_cnep.py [ceis.zip] [cnep.zip]
+    # If no args, tries to download from Portal da Transparência.
+    # Portal da Transparência may require manual download (WAF/captcha protection).
+    local_files = {k: v for k, v in zip(["ceis", "cnep"], sys.argv[1:])}
+
     conn = psycopg2.connect(
         host=DB_HOST, dbname=DB_NAME, user=DB_USER,
         password=DB_PASS, port=DB_PORT, connect_timeout=30,
@@ -152,11 +158,40 @@ def main():
     for dataset, label in DATASETS.items():
         print(f"\n=== {label} ===", flush=True)
         try:
-            url, ym = find_latest_url(dataset, label)
-            print(f"  Arquivo encontrado: {ym}", flush=True)
-            n = process_zip(label, url, cur)
-            conn.commit()
-            total += n
+            if dataset in local_files:
+                path = local_files[dataset]
+                print(f"  Usando arquivo local: {path}", flush=True)
+                with open(path, "rb") as f:
+                    content = io.BytesIO(f.read())
+                count = 0
+                with zipfile.ZipFile(content) as zf:
+                    for name in zf.namelist():
+                        if not name.upper().endswith(".CSV"):
+                            continue
+                        with zf.open(name) as f2:
+                            text = f2.read().decode("latin-1", errors="replace")
+                        import csv as csv_mod
+                        reader = csv_mod.DictReader(io.StringIO(text), delimiter=";")
+                        rows = []
+                        for row in reader:
+                            keys = {k.strip().lower(): v.strip() for k, v in row.items()}
+                            cnpj_raw = (keys.get("cadastro cpf ou cnpj do sancionado") or keys.get("cnpj") or "")
+                            data_ini = parse_date(keys.get("data de início da sanção") or "")
+                            data_fim_raw = keys.get("data de fim da sanção") or ""
+                            data_fim = parse_date(data_fim_raw) if data_fim_raw else None
+                            ativo = not bool(data_fim) or (datetime.strptime(data_fim, "%Y-%m-%d") >= datetime.today() if data_fim else True)
+                            rows.append((label, cnpj_raw or None, clean_cnpj(cnpj_raw), keys.get("nome informado pelo órgão sancionador") or None, keys.get("tipo de sanção") or None, data_ini, data_fim, keys.get("órgão sancionador") or None, (keys.get("uf do órgão sancionador") or "")[:2] or None, keys.get("número do processo") or None, ativo,))
+                        cur.executemany("INSERT INTO dados_rfb.sancoes_federais (fonte,cnpj_cpf,cnpj_14,nome_sancionado,tipo_sancao,data_inicio,data_fim,orgao_sancionador,uf_orgao,processo,ativo) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
+                        count += len(rows)
+                        print(f"  {len(rows):,} registros de {name}", flush=True)
+                conn.commit()
+                total += count
+            else:
+                url, ym = find_latest_url(dataset, label)
+                print(f"  Arquivo encontrado: {ym}", flush=True)
+                n = process_zip(label, url, cur)
+                conn.commit()
+                total += n
         except Exception as e:
             print(f"  ERRO {label}: {e}", flush=True)
             conn.rollback()
@@ -166,6 +201,10 @@ def main():
     conn.commit()
 
     print(f"\n=== CONCLUÍDO: {total:,} sanções importadas ===", flush=True)
+    print("\nNOTA: Se download falhou, baixe manualmente em:")
+    print("  CEIS: https://portaldatransparencia.gov.br/download-de-dados/ceis")
+    print("  CNEP: https://portaldatransparencia.gov.br/download-de-dados/cnep")
+    print("  Uso: python etl_ceis_cnep.py /caminho/CEIS.zip /caminho/CNEP.zip")
     conn.close()
 
 

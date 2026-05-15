@@ -7,16 +7,16 @@ Fontes:
   CEPIM:     https://portaldatransparencia.gov.br/download-de-dados/cepim
   Leniência: https://portaldatransparencia.gov.br/download-de-dados/acordos-leniencia
 """
-import os, io, csv, zipfile, re, requests, psycopg2
+import os, io, csv, zipfile, re, pathlib, requests, psycopg2
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=str(pathlib.Path().resolve() / ".env"))
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_NAME = os.getenv("DB_NAME", "rfb")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASS = os.getenv("DB_PASS", "")
+DB_HOST = os.getenv("DB_HOST", "187.127.13.118")
+DB_NAME = os.getenv("DB_NAME", "dados_rfb")
+DB_USER = os.getenv("DB_USER", "pguser")
+DB_PASS = os.getenv("DB_PASSWORD") or os.getenv("POSTGRES_PASSWORD", "")
 DB_PORT = int(os.getenv("DB_PORT", 5432))
 
 DATASETS = {

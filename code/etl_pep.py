@@ -3,16 +3,16 @@ ETL PEP — Pessoas Expostas Politicamente (Portal da Transparência / CGU)
 Baixa CSV e importa para dados_rfb.pep.
 Fonte: https://portaldatransparencia.gov.br/download-de-dados/pep
 """
-import os, io, csv, zipfile, re, requests, psycopg2
+import os, io, csv, zipfile, re, pathlib, requests, psycopg2
 from datetime import datetime
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=str(pathlib.Path().resolve() / ".env"))
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_NAME = os.getenv("DB_NAME", "rfb")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASS = os.getenv("DB_PASS", "")
+DB_HOST = os.getenv("DB_HOST", "187.127.13.118")
+DB_NAME = os.getenv("DB_NAME", "dados_rfb")
+DB_USER = os.getenv("DB_USER", "pguser")
+DB_PASS = os.getenv("DB_PASSWORD") or os.getenv("POSTGRES_PASSWORD", "")
 DB_PORT = int(os.getenv("DB_PORT", 5432))
 
 BASE_URL = "https://portaldatransparencia.gov.br/download-de-dados/pep"
@@ -132,6 +132,10 @@ def process_zip(url: str, cur) -> int:
 
 
 def main():
+    import sys
+    # Usage: python etl_pep.py [pep.zip]
+    local_file = sys.argv[1] if len(sys.argv) > 1 else None
+
     conn = psycopg2.connect(
         host=DB_HOST, dbname=DB_NAME, user=DB_USER,
         password=DB_PASS, port=DB_PORT, connect_timeout=30,
@@ -148,18 +152,27 @@ def main():
     conn.commit()
 
     try:
-        url, ym = find_latest_url()
-        print(f"Arquivo encontrado: {ym}", flush=True)
-        n = process_zip(url, cur)
+        if local_file:
+            print(f"Usando arquivo local: {local_file}", flush=True)
+            with open(local_file, "rb") as f:
+                url = f"file://{local_file}"
+            n = process_zip(url, cur)  # process_zip handles local via requests
+        else:
+            url, ym = find_latest_url()
+            print(f"Arquivo encontrado: {ym}", flush=True)
+            n = process_zip(url, cur)
         conn.commit()
-        print(f"\n=== ANALYZE ===", flush=True)
+        print("\n=== ANALYZE ===", flush=True)
         cur.execute("ANALYZE dados_rfb.pep")
         conn.commit()
         print(f"\n=== CONCLUÍDO: {n:,} PEPs importados ===", flush=True)
     except Exception as e:
         print(f"ERRO: {e}", flush=True)
         conn.rollback()
-
+    finally:
+        print("\nNOTA: Se download falhou, baixe manualmente em:")
+        print("  https://portaldatransparencia.gov.br/download-de-dados/pep")
+        print("  Uso: python etl_pep.py /caminho/PEP.zip")
     conn.close()
 
 
