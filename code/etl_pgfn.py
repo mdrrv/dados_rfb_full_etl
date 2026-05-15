@@ -28,9 +28,14 @@ DB_USER = os.getenv("DB_USER", "pguser")
 DB_PASS = os.getenv("DB_PASSWORD") or os.getenv("POSTGRES_PASSWORD", "")
 DB_PORT = int(os.getenv("DB_PORT", 5432))
 
-BASE_URL = "https://dadosabertos.pgfn.gov.br/Dados_abertos/PGFN"
-# Arquivos disponíveis por tipo de dívida (RURAL removido — não existe no PGFN aberto)
-TIPOS = ["FGTS", "NAO_PREVIDENCIARIO", "PREVIDENCIARIO"]
+BASE_URL = "https://dadosabertos.pgfn.gov.br"
+# Nome dos arquivos dentro de cada diretório trimestral
+TIPO_FILES = {
+    "FGTS": "Dados_abertos_FGTS.zip",
+    "NAO_PREVIDENCIARIO": "Dados_abertos_Nao_Previdenciario.zip",
+    "PREVIDENCIARIO": "Dados_abertos_Previdenciario.zip",
+}
+TIPOS = list(TIPO_FILES.keys())
 
 DDL = """
 CREATE TABLE IF NOT EXISTS dados_rfb.pgfn_divida_ativa (
@@ -81,24 +86,22 @@ def parse_valor(s: str) -> "float | None":
 
 
 def find_latest_url(tipo: str) -> "str | None":
+    """Procura no diretório trimestral mais recente disponível."""
     today = date.today()
+    filename = TIPO_FILES[tipo]
     for year in range(today.year, today.year - 3, -1):
-        for month in range(12, 0, -1):
-            # Skip future months
-            if year == today.year and month > today.month:
+        for q in range(4, 0, -1):
+            # Skip future quarters
+            if year == today.year and q * 3 > today.month + 2:
                 continue
-            yymm = f"{year}{month:02d}"
-            candidates = [
-                f"{BASE_URL}/{year}/{tipo}_{yymm}.zip",
-                f"{BASE_URL}/{tipo}_{yymm}.zip",
-            ]
-            for url in candidates:
-                try:
-                    r = requests.head(url, timeout=8, allow_redirects=True)
-                    if r.status_code == 200:
-                        return url
-                except Exception:
-                    pass
+            dir_name = f"{year}_trimestre_{q:02d}"
+            url = f"{BASE_URL}/{dir_name}/{filename}"
+            try:
+                r = requests.head(url, timeout=8, allow_redirects=True)
+                if r.status_code == 200:
+                    return url
+            except Exception:
+                pass
     return None
 
 
