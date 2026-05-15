@@ -76,11 +76,10 @@ def process_zip(url: str, cur, year: int) -> int:
     buf = io.BytesIO(r.content)
     count = 0
     with zipfile.ZipFile(buf) as zf:
-        # Use BR-wide file (without UF suffix) or combine all
         names = [n for n in zf.namelist() if n.upper().endswith(".CSV")]
-        # Prefer the consolidated file if it exists
-        main_files = [n for n in names if "BRASIL" in n.upper() or n.count("_") <= 3]
-        target_files = main_files if main_files else names[:1]  # just first file if no brasil
+        # Consolidated BRASIL file takes priority; otherwise process all state files
+        brasil = [n for n in names if "BRASIL" in n.upper()]
+        target_files = brasil if brasil else names
 
         for name in target_files:
             print(f"  Processando {name} ...", flush=True)
@@ -116,7 +115,6 @@ def process_zip(url: str, cur, year: int) -> int:
             """, rows)
             count += len(rows)
             print(f"  {len(rows):,} candidatos de {name}", flush=True)
-            break  # one file is enough for the consolidated national data
     return count
 
 
