@@ -1,14 +1,12 @@
 """
 Script standalone: popula cnpj_consolidado em chunks por faixa de cnpj_basico.
 
-Estratégia: sem carregar empresa/simples na RAM.
-- Divide estabelecimento em 100 faixas pelos dois primeiros dígitos de cnpj_basico (00 a 99)
-- Para cada faixa: PostgreSQL faz o JOIN com índices, COPY TO STDOUT → Python
-- Python grava no cnpj_consolidado via COPY FROM STDIN
+Estratégia zero-downtime: escreve em cnpj_consolidado_new, depois swap atômico.
+A tabela de produção fica intacta até o build estar 100% completo.
 
 Uso:
-    cd /root/dados_rfb_full_etl
-    source /root/etl_venv/bin/activate
+    cd /root/app/dados_rfb_full_etl
+    source /root/venv-etl/bin/activate
     nohup python -u code/consolidar.py > /root/consolidar.log 2>&1 &
 """
 import os
@@ -19,7 +17,6 @@ import time
 import psycopg2
 from dotenv import load_dotenv
 
-# ── env ──────────────────────────────────────────────────────────────────────
 current_path = pathlib.Path().resolve()
 dotenv_path = os.path.join(current_path, '.env')
 if not os.path.isfile(dotenv_path):
@@ -36,16 +33,19 @@ db_schema = os.getenv('DB_SCHEMA')
 
 DSN = f"dbname={database} user={user} host={host} port={port} password={password}"
 
-# ── conexões ─────────────────────────────────────────────────────────────────
 conn = psycopg2.connect(DSN)
 
-# ── truncate ─────────────────────────────────────────────────────────────────
-print("Truncando cnpj_consolidado...", flush=True)
+# Cria tabela _new (mesma estrutura, sem índices para inserção rápida)
+print("Criando cnpj_consolidado_new...", flush=True)
 with conn.cursor() as c:
-    c.execute(f'TRUNCATE TABLE "{db_schema}"."cnpj_consolidado";')
+    c.execute(f'DROP TABLE IF EXISTS "{db_schema}"."cnpj_consolidado_new" CASCADE')
+    c.execute(f'''
+        CREATE TABLE "{db_schema}"."cnpj_consolidado_new"
+        (LIKE "{db_schema}"."cnpj_consolidado" INCLUDING DEFAULTS)
+    ''')
 conn.commit()
 
-# ── verifica índice em estabelecimento ───────────────────────────────────────
+# Verifica índice em estabelecimento
 print("Verificando índice em estabelecimento.cnpj_basico...", flush=True)
 with conn.cursor() as c:
     c.execute("""
@@ -64,13 +64,10 @@ with conn.cursor() as c:
     else:
         print(f"  Índice encontrado: {idx[0]}", flush=True)
 
-# ── Aumento temporário de memória no DB para os JOINs ────────────────────────
-print("Ajustando work_mem da conexão para acelerar os joins...", flush=True)
+print("Ajustando work_mem...", flush=True)
 with conn.cursor() as c:
     c.execute("SET work_mem = '256MB';")
 conn.commit()
-
-# ── JOIN por faixas de cnpj_basico ────────────────────────────────────────────
 
 FINAL_COLS = [
     'cnpj', 'cnpj_basico', 'razao_social', 'nome_fantasia',
@@ -130,9 +127,9 @@ COPY_SELECT = f"""
 """
 
 INSERT_SQL = f"""
-    INSERT INTO "{db_schema}"."cnpj_consolidado" ({col_list})
+    INSERT INTO "{db_schema}"."cnpj_consolidado_new" ({col_list})
     {COPY_SELECT}
-    ON CONFLICT (cnpj) DO NOTHING;
+    ON CONFLICT DO NOTHING;
 """
 
 print("\nIniciando consolidação em 100 pedaços (00 a 99)...", flush=True)
@@ -141,70 +138,62 @@ start = time.time()
 
 for digit in range(100):
     t0 = time.time()
-    
-    # FORMATADOR MÁGICO: Transforma 0 em "00", 1 em "01", etc.
-    digit_str = f"{digit:02d}" 
-    
+    digit_str = f"{digit:02d}"
     print(f"  Faixa {digit_str}... ", end='', flush=True)
-
     with conn.cursor() as c:
-        c.execute(
-            INSERT_SQL.replace('{digit}', digit_str)
-        )
+        c.execute(INSERT_SQL.replace('{digit}', digit_str))
         n = c.rowcount
         conn.commit()
-
     total_inserted += n
     print(f"{n:,} inseridos ({round(time.time()-t0)}s) — total: {total_inserted:,}", flush=True)
 
 total_secs = round(time.time() - start)
-print(f"\ncnpj_consolidado populado! {total_inserted:,} registros em {total_secs}s ({round(total_secs/60)}min)")
+print(f"\ncnpj_consolidado_new populado: {total_inserted:,} registros em {total_secs}s ({round(total_secs/60)}min)", flush=True)
 
-# ── analyze ──────────────────────────────────────────────────────────────────
-print("\nAtualizando estatísticas do Postgres (ANALYZE)...", flush=True)
-with conn.cursor() as c:
-    c.execute(f'ANALYZE "{db_schema}"."cnpj_consolidado";')
-conn.commit()
-
-# ── índices pós-consolidação ──────────────────────────────────────────────────
-INDEXES = [
-    ("idx_cnpj_consolidado_cnpj_basico", "cnpj_consolidado", "cnpj_basico"),
-    ("idx_cnpj_consolidado_razao_trgm",  None,               None),          # trigrama — criado separadamente
-    ("idx_consolidado_cep",              "cnpj_consolidado", "cep"),
-    ("idx_consolidado_email",            "cnpj_consolidado", "correio_eletronico"),
-    ("idx_consolidado_cnae",             "cnpj_consolidado", "cnae_fiscal_principal"),
-    ("idx_socios_cpf_cnpj",              "socios",           "cpf_cnpj_socio"),
-]
-
+# Índices em _new antes do swap
+print("\nCriando índices em cnpj_consolidado_new...", flush=True)
 conn2 = psycopg2.connect(DSN)
-conn2.autocommit = True  # CREATE INDEX não pode rodar dentro de transação
+conn2.autocommit = True
 
-print("\nVerificando índices...", flush=True)
+INDEXES = [
+    ("idx_cnpj_cons_new_cnpj_basico", "cnpj_consolidado_new", "cnpj_basico"),
+    ("idx_cnpj_cons_new_cep",         "cnpj_consolidado_new", "cep"),
+    ("idx_cnpj_cons_new_email",       "cnpj_consolidado_new", "correio_eletronico"),
+    ("idx_cnpj_cons_new_cnae",        "cnpj_consolidado_new", "cnae_fiscal_principal"),
+    ("idx_cnpj_cons_new_uf",          "cnpj_consolidado_new", "uf"),
+]
 for idx_name, table, column in INDEXES:
-    if table is None:
-        with conn2.cursor() as c:
-            c.execute("SELECT 1 FROM pg_indexes WHERE schemaname = %s AND indexname = %s", (db_schema, idx_name))
-            if not c.fetchone():
-                print(f"  AVISO: {idx_name} não existe — crie manualmente com pg_trgm extension.", flush=True)
-            else:
-                print(f"  OK: {idx_name}", flush=True)
-        continue
-
+    t0 = time.time()
+    print(f"  {idx_name}... ", end='', flush=True)
     with conn2.cursor() as c:
-        c.execute(
-            "SELECT 1 FROM pg_indexes WHERE schemaname = %s AND tablename = %s AND indexname = %s",
-            (db_schema, table, idx_name)
-        )
-        exists = c.fetchone()
-
-    if exists:
-        print(f"  OK: {idx_name}", flush=True)
-    else:
-        print(f"  Criando {idx_name} em {table}.{column}...", end=' ', flush=True)
-        t0 = time.time()
-        with conn2.cursor() as c:
-            c.execute(f'CREATE INDEX IF NOT EXISTS {idx_name} ON "{db_schema}"."{table}" ({column});')
-        print(f"({round(time.time()-t0)}s)", flush=True)
+        c.execute(f'CREATE INDEX {idx_name} ON "{db_schema}"."{table}" ({column})')
+    print(f"({round(time.time()-t0)}s)", flush=True)
 
 conn2.close()
+
+# ANALYZE antes do swap para estatísticas corretas
+print("\nANALYZE em cnpj_consolidado_new...", flush=True)
+with conn.cursor() as c:
+    c.execute(f'ANALYZE "{db_schema}"."cnpj_consolidado_new"')
+conn.commit()
+
+# Swap atômico: _new → produção, produção → _old, drop _old
+print("\nSwap atômico cnpj_consolidado_new → cnpj_consolidado...", flush=True)
+with conn.cursor() as c:
+    c.execute(f'ALTER TABLE "{db_schema}"."cnpj_consolidado"     RENAME TO "cnpj_consolidado_old"')
+    c.execute(f'ALTER TABLE "{db_schema}"."cnpj_consolidado_new" RENAME TO "cnpj_consolidado"')
+    c.execute(f'DROP TABLE  "{db_schema}"."cnpj_consolidado_old"')
+conn.commit()
+print("Swap concluído. cnpj_consolidado atualizado com zero downtime.", flush=True)
+
+# Verifica índice trigrama (criado externamente)
+with conn.cursor() as c:
+    c.execute("SELECT 1 FROM pg_indexes WHERE schemaname = %s AND indexname = %s",
+              (db_schema, 'idx_cnpj_consolidado_razao_trgm'))
+    if not c.fetchone():
+        print("AVISO: idx_cnpj_consolidado_razao_trgm não existe — crie manualmente com pg_trgm.", flush=True)
+    else:
+        print("OK: idx_cnpj_consolidado_razao_trgm presente.", flush=True)
+
+conn.close()
 print("\nProcesso Finalizado com Sucesso!", flush=True)

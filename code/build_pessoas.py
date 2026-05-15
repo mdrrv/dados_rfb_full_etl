@@ -75,19 +75,29 @@ CREATE INDEX IF NOT EXISTS idx_socios_pessoa_id ON "{SCHEMA}".socios (pessoa_id)
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+DDL_PESSOAS_NEW = f"""
+CREATE TABLE IF NOT EXISTS "{SCHEMA}".pessoas_new (
+    id          UUID        PRIMARY KEY,
+    cpf_cnpj    TEXT        NOT NULL,
+    nome        TEXT        NOT NULL,
+    slug        TEXT        NOT NULL UNIQUE
+);
+"""
+
 def main():
     conn = psycopg2.connect(DSN)
     cur = conn.cursor()
 
-    print("Criando tabela pessoas e coluna socios.pessoa_id...")
-    cur.execute(DDL_PESSOAS)
+    # Cria coluna pessoa_id em socios se não existir
     cur.execute(DDL_FK)
     conn.commit()
 
-    print("Limpando para reprocessamento...")
-    # DROP COLUMN é DDL — instantâneo, evita UPDATE full-scan em 27M linhas
+    # Zero-downtime: escreve em pessoas_new, swap atômico ao final
+    print("Criando pessoas_new...")
+    cur.execute(f'DROP TABLE IF EXISTS "{SCHEMA}".pessoas_new CASCADE')
+    cur.execute(DDL_PESSOAS_NEW)
     cur.execute(f'ALTER TABLE "{SCHEMA}".socios DROP COLUMN IF EXISTS pessoa_id')
-    cur.execute(f'TRUNCATE "{SCHEMA}".pessoas')
+    cur.execute(DDL_FK)
     conn.commit()
 
     print("Carregando distinct cpf_cnpj_socio + nome...")
@@ -115,26 +125,50 @@ def main():
 
     print("Inserindo em pessoas (UPSERT)...")
     insert_sql = f"""
-        INSERT INTO "{SCHEMA}".pessoas (id, cpf_cnpj, nome, slug)
+        INSERT INTO "{SCHEMA}".pessoas_new (id, cpf_cnpj, nome, slug)
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (id) DO NOTHING
     """
     batch = [(str(uid), cpf, nome, slug) for (cpf, _), (uid, nome, slug) in seen.items()]
     cur.executemany(insert_sql, batch)
     conn.commit()
-    print(f"  {cur.rowcount:,} linhas inseridas")
+    print(f"  {cur.rowcount:,} linhas inseridas em pessoas_new")
 
-    print("Atualizando socios.pessoa_id...")
+    print("Atualizando socios.pessoa_id (via pessoas_new)...")
     cur.execute(f"""
         UPDATE "{SCHEMA}".socios s
         SET pessoa_id = p.id
-        FROM "{SCHEMA}".pessoas p
+        FROM "{SCHEMA}".pessoas_new p
         WHERE s.cpf_cnpj_socio = p.cpf_cnpj
           AND UPPER(TRIM(s.nome_socio_razao_social)) = p.nome
           AND s.pessoa_id IS NULL
     """)
     conn.commit()
     print(f"  {cur.rowcount:,} vínculos atualizados")
+
+    # Índices em _new antes do swap
+    print("Criando índices em pessoas_new...")
+    for sql in [
+        f'CREATE INDEX idx_pessoas_new_cpf ON "{SCHEMA}".pessoas_new (cpf_cnpj)',
+        f'CREATE INDEX idx_pessoas_new_slug ON "{SCHEMA}".pessoas_new (slug)',
+    ]:
+        cur.execute(sql)
+    conn.commit()
+
+    # Swap atômico: pessoas_new → pessoas
+    print("Swap atômico pessoas_new → pessoas...")
+    cur.execute(f"""
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = %s AND table_name = 'pessoas'
+    """, (SCHEMA,))
+    exists = cur.fetchone()
+    if exists:
+        cur.execute(f'ALTER TABLE "{SCHEMA}".pessoas     RENAME TO pessoas_old')
+        cur.execute(f'ALTER TABLE "{SCHEMA}".pessoas_new RENAME TO pessoas')
+        cur.execute(f'DROP TABLE  "{SCHEMA}".pessoas_old')
+    else:
+        cur.execute(f'ALTER TABLE "{SCHEMA}".pessoas_new RENAME TO pessoas')
+    conn.commit()
 
     cur.close()
     conn.close()
