@@ -29,8 +29,8 @@ DB_PASS = os.getenv("DB_PASSWORD") or os.getenv("POSTGRES_PASSWORD", "")
 DB_PORT = int(os.getenv("DB_PORT", 5432))
 
 BASE_URL = "https://dadosabertos.pgfn.gov.br/Dados_abertos/PGFN"
-# Arquivos disponíveis por tipo de dívida
-TIPOS = ["FGTS", "NAO_PREVIDENCIARIO", "PREVIDENCIARIO", "RURAL"]
+# Arquivos disponíveis por tipo de dívida (RURAL removido — não existe no PGFN aberto)
+TIPOS = ["FGTS", "NAO_PREVIDENCIARIO", "PREVIDENCIARIO"]
 
 DDL = """
 CREATE TABLE IF NOT EXISTS dados_rfb.pgfn_divida_ativa (
@@ -80,19 +80,26 @@ def parse_valor(s: str) -> "float | None":
         return None
 
 
-def find_latest_url(tipo: str) -> str:
+def find_latest_url(tipo: str) -> "str | None":
     today = date.today()
-    for year in range(today.year, today.year - 2, -1):
-        for q in range(4, 0, -1):
-            month = str(q * 3).zfill(2)
-            url = f"{BASE_URL}/{year}/{tipo}_{year}{month}.zip"
-            try:
-                r = requests.head(url, timeout=10, allow_redirects=True)
-                if r.status_code == 200:
-                    return url
-            except Exception:
-                pass
-    return f"{BASE_URL}/{today.year}/{tipo}_{today.year}03.zip"
+    for year in range(today.year, today.year - 3, -1):
+        for month in range(12, 0, -1):
+            # Skip future months
+            if year == today.year and month > today.month:
+                continue
+            yymm = f"{year}{month:02d}"
+            candidates = [
+                f"{BASE_URL}/{year}/{tipo}_{yymm}.zip",
+                f"{BASE_URL}/{tipo}_{yymm}.zip",
+            ]
+            for url in candidates:
+                try:
+                    r = requests.head(url, timeout=8, allow_redirects=True)
+                    if r.status_code == 200:
+                        return url
+                except Exception:
+                    pass
+    return None
 
 
 def process_file(buf: io.BytesIO, tipo: str, cur) -> int:
@@ -174,6 +181,9 @@ def main():
     else:
         for tipo in TIPOS:
             url = find_latest_url(tipo)
+            if not url:
+                print(f"\n=== {tipo}: nenhuma URL encontrada, pulando ===", flush=True)
+                continue
             print(f"\n=== {tipo}: {url} ===", flush=True)
             try:
                 r = requests.get(url, timeout=300, stream=True)
