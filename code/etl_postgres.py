@@ -667,10 +667,12 @@ print("\n#############################################")
 print("## Populando tabela cnpj_consolidado (Polars + streaming)...")
 consolidado_start = time.time()
 
-cur.execute(f'TRUNCATE TABLE "{db_schema}"."cnpj_consolidado";')
-conn.commit()
-
 DSN = f"dbname={database} user={user} host={host} port={port} password={password}"
+
+# Cria staging para swap zero-downtime (cnpj_consolidado nunca fica vazia)
+cur.execute(f'DROP TABLE IF EXISTS "{db_schema}"."cnpj_consolidado_new";')
+cur.execute(f'CREATE TABLE "{db_schema}"."cnpj_consolidado_new" (LIKE "{db_schema}"."cnpj_consolidado" INCLUDING DEFAULTS);')
+conn.commit()
 
 def fetch_lookup(conn, name, query, chunk_size=1_000_000):
     """Carrega tabela de lookup no Polars via server-side cursor (baixo pico de RAM).
@@ -793,7 +795,7 @@ with conn.cursor('estab_stream') as sc:
             .select(FINAL_COLS)
         )
 
-        to_sql(result, 'cnpj_consolidado', conn_write, db_schema)
+        to_sql(result, 'cnpj_consolidado_new', conn_write, db_schema)
         total_inserted += len(result)
         print(f"  Chunk {chunk_num}: {total_inserted:,} inseridos ({round(time.time()-t0)}s)", flush=True)
         del chunk_df, result
@@ -803,7 +805,70 @@ conn.commit()  # fecha o named cursor
 conn_write.close()
 
 consolidado_end = time.time()
-print(f"cnpj_consolidado populado com sucesso! Tempo (segundos): {round(consolidado_end - consolidado_start)}")
+print(f"cnpj_consolidado_new populado com {total_inserted:,} registros em {round(consolidado_end - consolidado_start)}s")
+
+# ── Rebuild índices em cnpj_consolidado_new, depois swap zero-downtime ─────────
+print("\n## Recriando índices em cnpj_consolidado_new...")
+_DROP_OLD_IDX = [
+    "cnpj_consolidado_basico", "cnpj_consolidado_cnpj", "cnpj_consolidado_email",
+    "cnpj_consolidado_endereco", "cnpj_consolidado_fantasia_trgm", "cnpj_consolidado_razao",
+    "cnpj_consolidado_razao_trgm", "cnpj_consolidado_sit", "cnpj_consolidado_uf",
+    "cnpj_consolidado_uf_mun", "idx_cnpj_consolidado_cnpj_basico", "idx_cnpj_consolidado_razao",
+    "idx_cnpj_consolidado_razao_trgm", "idx_consolidado_cep", "idx_consolidado_cnae",
+    "idx_consolidado_email", "idx_fantasia_trgm", "idx_fantasia_unaccent_trgm",
+    "idx_fts_simple", "idx_fts_simple_ativa", "idx_razao_social_btree",
+    "idx_razao_trgm", "idx_razao_unaccent_trgm",
+]
+with conn.cursor() as _c:
+    for _idx in _DROP_OLD_IDX:
+        _c.execute(f'DROP INDEX IF EXISTS "{db_schema}"."{_idx}";')
+conn.commit()
+print("  Índices antigos removidos (libera nomes para a staging).")
+
+_INDEX_DDLS = [
+    f'CREATE UNIQUE INDEX IF NOT EXISTS cnpj_consolidado_cnpj ON "{db_schema}"."cnpj_consolidado_new" USING btree (cnpj)',
+    f'CREATE INDEX IF NOT EXISTS cnpj_consolidado_basico ON "{db_schema}"."cnpj_consolidado_new" USING btree (cnpj_basico)',
+    f'CREATE INDEX IF NOT EXISTS cnpj_consolidado_sit ON "{db_schema}"."cnpj_consolidado_new" USING btree (situacao_cadastral)',
+    f'CREATE INDEX IF NOT EXISTS cnpj_consolidado_uf ON "{db_schema}"."cnpj_consolidado_new" USING btree (uf)',
+    f'CREATE INDEX IF NOT EXISTS cnpj_consolidado_uf_mun ON "{db_schema}"."cnpj_consolidado_new" USING btree (uf, nome_municipio)',
+    f'CREATE INDEX IF NOT EXISTS cnpj_consolidado_razao ON "{db_schema}"."cnpj_consolidado_new" USING btree (razao_social)',
+    f'CREATE INDEX IF NOT EXISTS cnpj_consolidado_endereco ON "{db_schema}"."cnpj_consolidado_new" USING btree (cep, logradouro, numero)',
+    f'CREATE INDEX IF NOT EXISTS cnpj_consolidado_email ON "{db_schema}"."cnpj_consolidado_new" USING btree (correio_eletronico) WHERE (correio_eletronico IS NOT NULL)',
+    f'CREATE INDEX IF NOT EXISTS idx_cnpj_consolidado_cnpj_basico ON "{db_schema}"."cnpj_consolidado_new" USING btree (cnpj_basico)',
+    f'CREATE INDEX IF NOT EXISTS idx_consolidado_cep ON "{db_schema}"."cnpj_consolidado_new" USING btree (cep)',
+    f'CREATE INDEX IF NOT EXISTS idx_consolidado_cnae ON "{db_schema}"."cnpj_consolidado_new" USING btree (cnae_fiscal_principal)',
+    f'CREATE INDEX IF NOT EXISTS idx_consolidado_email ON "{db_schema}"."cnpj_consolidado_new" USING btree (correio_eletronico)',
+    f'CREATE INDEX IF NOT EXISTS idx_razao_social_btree ON "{db_schema}"."cnpj_consolidado_new" USING btree (razao_social)',
+    f'CREATE INDEX IF NOT EXISTS cnpj_consolidado_razao_trgm ON "{db_schema}"."cnpj_consolidado_new" USING gin (immutable_unaccent(razao_social) gin_trgm_ops)',
+    f'CREATE INDEX IF NOT EXISTS cnpj_consolidado_fantasia_trgm ON "{db_schema}"."cnpj_consolidado_new" USING gin (immutable_unaccent(nome_fantasia) gin_trgm_ops)',
+    f'CREATE INDEX IF NOT EXISTS idx_cnpj_consolidado_razao_trgm ON "{db_schema}"."cnpj_consolidado_new" USING gin (razao_social gin_trgm_ops)',
+    f'CREATE INDEX IF NOT EXISTS idx_fantasia_trgm ON "{db_schema}"."cnpj_consolidado_new" USING gin (immutable_unaccent(nome_fantasia) gin_trgm_ops)',
+    f'CREATE INDEX IF NOT EXISTS idx_fantasia_unaccent_trgm ON "{db_schema}"."cnpj_consolidado_new" USING gin (immutable_unaccent(nome_fantasia) gin_trgm_ops)',
+    f'CREATE INDEX IF NOT EXISTS idx_razao_trgm ON "{db_schema}"."cnpj_consolidado_new" USING gin (immutable_unaccent(razao_social) gin_trgm_ops)',
+    f'CREATE INDEX IF NOT EXISTS idx_razao_unaccent_trgm ON "{db_schema}"."cnpj_consolidado_new" USING gin (immutable_unaccent(razao_social) gin_trgm_ops)',
+    f"""CREATE INDEX IF NOT EXISTS idx_cnpj_consolidado_razao ON "{db_schema}"."cnpj_consolidado_new" USING gin (to_tsvector('simple'::regconfig, ((COALESCE(razao_social, ''::text) || ' '::text) || COALESCE(nome_fantasia, ''::text))))""",
+    f"""CREATE INDEX IF NOT EXISTS idx_fts_simple ON "{db_schema}"."cnpj_consolidado_new" USING gin (to_tsvector('simple'::regconfig, ((immutable_unaccent(COALESCE(razao_social, ''::text)) || ' '::text) || immutable_unaccent(COALESCE(nome_fantasia, ''::text)))))""",
+    f"""CREATE INDEX IF NOT EXISTS idx_fts_simple_ativa ON "{db_schema}"."cnpj_consolidado_new" USING gin (to_tsvector('simple'::regconfig, ((immutable_unaccent(COALESCE(razao_social, ''::text)) || ' '::text) || immutable_unaccent(COALESCE(nome_fantasia, ''::text))))) WHERE ((situacao_cadastral)::text = '02'::text)""",
+]
+_conn_idx = psycopg2.connect(DSN)
+_conn_idx.autocommit = True
+for _ddl in _INDEX_DDLS:
+    _name = _ddl.split('INDEX IF NOT EXISTS ')[1].split(' ')[0]
+    print(f"  {_name}... ", end='', flush=True)
+    _t0 = time.time()
+    with _conn_idx.cursor() as _c:
+        _c.execute(_ddl)
+    print(f"ok ({round(time.time()-_t0)}s)", flush=True)
+_conn_idx.close()
+
+with conn.cursor() as _c:
+    _c.execute(f'ALTER TABLE "{db_schema}"."cnpj_consolidado" RENAME TO "cnpj_consolidado_old";')
+    _c.execute(f'ALTER TABLE "{db_schema}"."cnpj_consolidado_new" RENAME TO "cnpj_consolidado";')
+conn.commit()
+with conn.cursor() as _c:
+    _c.execute(f'DROP TABLE "{db_schema}"."cnpj_consolidado_old";')
+conn.commit()
+print(f"Swap zero-downtime concluído. cnpj_consolidado com {total_inserted:,} registros e índices completos.")
 
 #############################################
 # Limpeza dos arquivos temporários
