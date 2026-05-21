@@ -673,15 +673,20 @@ conn.commit()
 DSN = f"dbname={database} user={user} host={host} port={port} password={password}"
 
 def fetch_lookup(conn, name, query, chunk_size=1_000_000):
-    """Carrega tabela de lookup no Polars via server-side cursor (baixo pico de RAM)."""
+    """Carrega tabela de lookup no Polars via server-side cursor (baixo pico de RAM).
+    Nota: com cursores nomeados (server-side) do psycopg2, cursor.description só é
+    populado após o primeiro fetchmany() — não acessar antes disso.
+    """
     parts = []
+    cols = None
     with conn.cursor(f'lookup_{name}') as lc:
         lc.execute(query)
-        cols = [d[0] for d in lc.description]
         while True:
             rows = lc.fetchmany(chunk_size)
             if not rows:
                 break
+            if cols is None:
+                cols = [d[0] for d in lc.description]
             data = {col: [r[i] for r in rows] for i, col in enumerate(cols)}
             parts.append(pl.DataFrame(data))
             del rows, data
