@@ -82,7 +82,7 @@ cur2.execute(f"""
         s.data_entrada_sociedade,
         s.pais,
         s.faixa_etaria,
-        s.pessoa_id,
+        p.id AS pessoa_id,
         c.razao_social,
         c.situacao_cadastral,
         c.data_situacao_cadastral,
@@ -94,6 +94,9 @@ cur2.execute(f"""
         c.porte_empresa,
         c.capital_social
     FROM "{SCHEMA}".socios s
+    LEFT JOIN "{SCHEMA}".pessoas p
+        ON p.nome = s.nome_socio_razao_social
+        AND p.cpf_cnpj = s.cpf_cnpj_socio
     LEFT JOIN LATERAL (
         SELECT razao_social, situacao_cadastral, data_situacao_cadastral,
                data_inicio_atividade, cnae_fiscal_principal, desc_cnae_principal,
@@ -132,16 +135,19 @@ conn2.close()
 print("\nCriando índices em socios_consolidado_new...", flush=True)
 conn3 = psycopg2.connect(DSN)
 conn3.autocommit = True
-for name, col in [
-    ("idx_sc_new_cnpj_basico", "cnpj_basico"),
-    ("idx_sc_new_cpf_cnpj",    "cpf_cnpj_socio"),
-    ("idx_sc_new_pessoa_id",   "pessoa_id"),
-    ("idx_sc_new_situacao",    "situacao_cadastral"),
+for name, col, method in [
+    ("idx_sc_new_cnpj_basico",  "cnpj_basico",                          "btree"),
+    ("idx_sc_new_cpf_cnpj",     "cpf_cnpj_socio",                       "btree"),
+    ("idx_sc_new_pessoa_id",    "pessoa_id",                             "btree"),
+    ("idx_sc_new_situacao",     "situacao_cadastral",                    "btree"),
+    ("idx_sc_new_uf",           "uf",                                    "btree"),
+    ("idx_sc_new_cnpj_sit",     "cnpj_basico, situacao_cadastral",       "btree"),
+    ("idx_sc_new_nome_trgm",    "nome_socio_razao_social gin_trgm_ops",  "gin"),
 ]:
     t1 = time.time()
     print(f"  {name}... ", end='', flush=True)
     with conn3.cursor() as c:
-        c.execute(f'CREATE INDEX {name} ON "{SCHEMA}"."socios_consolidado_new" ({col})')
+        c.execute(f'CREATE INDEX {name} ON "{SCHEMA}"."socios_consolidado_new" USING {method} ({col})')
     print(f"({round(time.time()-t1)}s)", flush=True)
 conn3.close()
 
