@@ -33,13 +33,22 @@ meili = meilisearch.Client(MEILI_URL, MEILI_KEY)
 print(f"\nConfigurando Meilisearch index '{INDEX_NAME}'...", flush=True)
 try:
     meili.get_index(INDEX_NAME)
-    print("  Index existente — será reindexado.", flush=True)
+    print("  Index existente.", flush=True)
 except Exception:
     task = meili.create_index(INDEX_NAME, {"primaryKey": "id"})
     meili.wait_for_task(task.task_uid, timeout_in_ms=30_000)
     print("  Index criado.", flush=True)
 
 idx = meili.index(INDEX_NAME)
+
+# Detectar quantos docs já estão indexados para retomar onde parou
+already_indexed = 0
+try:
+    already_indexed = idx.get_stats().number_of_documents
+except Exception:
+    pass
+if already_indexed > 0:
+    print(f"  Resumindo: {already_indexed:,} docs já indexados — pulando com OFFSET.", flush=True)
 
 # Atributos de busca, filtro e ordenação
 idx.update_settings({
@@ -66,6 +75,7 @@ t0 = time.time()
 conn2 = psycopg2.connect(DSN)
 cur2  = conn2.cursor("meili_stream")
 cur2.itersize = CHUNK
+offset_clause = f"OFFSET {already_indexed}" if already_indexed > 0 else ""
 cur2.execute(f"""
     SELECT
         id::text,
@@ -81,9 +91,10 @@ cur2.execute(f"""
     FROM "{SCHEMA}".pessoas_consolidado
     WHERE nome IS NOT NULL AND nome != ''
     ORDER BY total_empresas DESC
+    {offset_clause}
 """)
 
-indexed = 0
+indexed = already_indexed
 chunk_num = 0
 pending_task = None
 
