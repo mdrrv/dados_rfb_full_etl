@@ -240,14 +240,25 @@ print("\n=== FASE 7: Swap atômico (RENAME) ===", flush=True)
 conn3 = psycopg2.connect(DSN)
 conn3.autocommit = False
 with conn3.cursor() as c:
-    c.execute(f'ALTER TABLE "{db_schema}"."cnpj_consolidado" RENAME TO "cnpj_consolidado_old";')
+    # Se cnpj_consolidado_old sobrou de run anterior, limpar primeiro
+    c.execute(f'DROP TABLE IF EXISTS "{db_schema}"."cnpj_consolidado_old";')
+    conn3.commit()
+    # Se cnpj_consolidado existe (run normal), renomear para _old; senão (primeiro run), skip
+    c.execute(f"""
+        SELECT EXISTS (
+            SELECT FROM pg_class WHERE relname = 'cnpj_consolidado'
+            AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '{db_schema}')
+        )
+    """)
+    if c.fetchone()[0]:
+        c.execute(f'ALTER TABLE "{db_schema}"."cnpj_consolidado" RENAME TO "cnpj_consolidado_old";')
     c.execute(f'ALTER TABLE "{db_schema}"."cnpj_consolidado_new" RENAME TO "cnpj_consolidado";')
 conn3.commit()
 print("  cnpj_consolidado agora aponta para os dados novos.", flush=True)
 with conn3.cursor() as c:
-    c.execute(f'DROP TABLE "{db_schema}"."cnpj_consolidado_old";')
+    c.execute(f'DROP TABLE IF EXISTS "{db_schema}"."cnpj_consolidado_old";')
 conn3.commit()
 conn3.close()
-print("  Tabela antiga (sem dados) removida.\n", flush=True)
+print("  Tabela antiga removida.\n", flush=True)
 
 print(f"=== CONCLUIDO: cnpj_consolidado reconstruida com {total_inserted:,} registros e {len(INDEX_DDLS)} indices (zero-downtime) ===", flush=True)
